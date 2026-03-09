@@ -1,9 +1,15 @@
+import os
+from dotenv import load_dotenv
 from langchain_ollama import ChatOllama
 from langchain_core.messages import AIMessage
 
+# Load environment variables from .env
+load_dotenv()
+ollama_api_base = os.getenv("OLLAMA_API_BASE")
 llm = ChatOllama(
-    model="deepseek-r1",
+    model="mistral:7b",
     temperature=0,
+    base_url=ollama_api_base
 )
 
 messages = [
