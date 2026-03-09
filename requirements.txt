@@ -1,0 +1,9 @@
+langchain
+langchain-ollama
+langchain-community
+langchain_text_splitters
+streamlit
+re
+chardet
+faiss-cpu
+dotenv
