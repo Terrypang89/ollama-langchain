@@ -1,3 +1,5 @@
 env/
 faiss_index
 .env
+logs
+__pycache__

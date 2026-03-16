@@ -1,11 +1,13 @@
 import subprocess
 import os
 from pathlib import Path
-import MetaTrader5 as mt5
 from dotenv import load_dotenv
+from datetime import datetime
 import pandas as pd
 import time
 import psutil  # install with pip if needed
+import shutil
+import glob
 
 load_dotenv()
 
@@ -103,30 +105,22 @@ Report={report_path}
         print("Updated existing ini file:", ini_path)
 
     return ini_path
+import subprocess
+import os
+import glob
+import shutil
+from datetime import datetime
 
-def run_mt5_backtest(config_path, terminal_path, report_path, log_path, portable_enable=True, timeout=60):
+def run_mt5_backtest(config_path, terminal_path, report_path, log_path, store_path,
+                     portable_enable=True, timeout=60):
     """
     Run MT5 backtest via terminal command with timeout.
-    Return the report file path if generated, else logs.
+    Remove old report variants and latest log file before run.
+    After run, copy all report variants and latest log into a dated versioned folder.
+    Return (report_file, latest_log_file, archive_folder).
     """
-    # Build command
-    if portable_enable:
-        cmd = [terminal_path, "/portable", f"/config:{config_path}"]
-    else:
-        cmd = [terminal_path, f"/config:{config_path}"]
 
-    # Start process
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-
-    try:
-        # Wait for completion (timeout in seconds)
-        stdout, stderr = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        print("Backtest timed out, killing process...")
-        proc.kill()
-        stdout, stderr = proc.communicate()
-
-    # Extract report path from ini file
+    # --- Extract report path from ini file ---
     report_file = None
     with open(config_path, "r") as f:
         for line in f:
@@ -134,13 +128,50 @@ def run_mt5_backtest(config_path, terminal_path, report_path, log_path, portable
                 report_file = line.strip().split("=", 1)[1]
                 break
 
-    # Normalize path (if relative, make absolute relative to ini folder)
-    if report_file:
-        if not os.path.isabs(report_file):
-            report_file = os.path.join(report_path, report_file)
-            print("report_file2:", report_file)
+    if report_file and not os.path.isabs(report_file):
+        report_file = os.path.join(report_path, report_file)
 
-     # Find latest log file
+    # --- Cleanup old report variants ---
+    if report_file:
+        base_name = os.path.splitext(report_file)[0]
+        pattern = base_name + "*"
+        for f in glob.glob(pattern):
+            try:
+                os.remove(f)
+                print("Removed old report variant:", f)
+            except Exception as e:
+                print("Could not remove:", f, e)
+
+    # --- Find and remove latest log file ---
+    latest_log_file = None
+    if os.path.exists(log_path):
+        log_files = [os.path.join(log_path, f) for f in os.listdir(log_path)
+                     if os.path.isfile(os.path.join(log_path, f))]
+        if log_files:
+            latest_log_file = max(log_files, key=os.path.getmtime)
+            try:
+                os.remove(latest_log_file)
+                print("Removed old log file:", latest_log_file)
+            except Exception as e:
+                print("Could not remove log file:", latest_log_file, e)
+
+    # --- Build command ---
+    if portable_enable:
+        cmd = [terminal_path, "/portable", f"/config:{config_path}"]
+    else:
+        cmd = [terminal_path, f"/config:{config_path}"]
+
+    # --- Start process ---
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        print("Backtest timed out, killing process...")
+        proc.kill()
+        stdout, stderr = proc.communicate()
+
+    # --- Find latest log file after run ---
     latest_log_file = None
     if os.path.exists(log_path):
         log_files = [os.path.join(log_path, f) for f in os.listdir(log_path)
@@ -148,11 +179,47 @@ def run_mt5_backtest(config_path, terminal_path, report_path, log_path, portable
         if log_files:
             latest_log_file = max(log_files, key=os.path.getmtime)
 
-    if os.path.exists(report_file) and os.path.exists(latest_log_file):
+    # --- Archive results ---
+    archive_folder = None
+    if report_file and os.path.exists(report_file):
+        today_str = datetime.today().strftime("%Y%m%d")
+        if not os.path.exists(store_path):
+            os.makedirs(store_path, exist_ok=True)
+        existing = [d for d in os.listdir(store_path)
+                    if os.path.isdir(os.path.join(store_path, d)) and d.startswith(today_str)]
+        version = 1
+        if existing:
+            versions = []
+            for d in existing:
+                parts = d.split("_")
+                if len(parts) == 2 and parts[0] == today_str:
+                    try:
+                        versions.append(int(parts[1]))
+                    except ValueError:
+                        pass
+            if versions:
+                version = max(versions) + 1
+
+        archive_folder = os.path.join(store_path, f"{today_str}_{version}")
+        os.makedirs(archive_folder, exist_ok=True)
+
+        # copy all report variants
+        base_name = os.path.splitext(report_file)[0]
+        for f in glob.glob(base_name + "*"):
+            if os.path.isfile(f):
+                shutil.copy(f, archive_folder)
+                print("Copied report variant:", f)
+
+        # copy latest log file
+        if latest_log_file and os.path.exists(latest_log_file):
+            shutil.copy(latest_log_file, archive_folder)
+            print("Copied log file:", latest_log_file)
+
+    # --- Return results ---
+    if report_file and os.path.exists(report_file):
         return report_file, latest_log_file
 
-    # If report not found, return logs instead
-    return stdout, stderr
+    return stdout + "\n" + stderr, latest_log_file
 
 def parse_backtest_report(report_file):
     """
@@ -167,10 +234,14 @@ def parse_backtest_report(report_file):
 
     return tables[0]  
 
-# EA_MQL_FILE = os.getenv("EA_MQL_FILE")
-# METAEDITOR_PATH = os.getenv("METAEDITOR_PATH")
-# result = compile_ea(EA_MQL_FILE, METAEDITOR_PATH)
+# compile EA
+MT5_PATH = os.getenv("MT5_PATH")
+AGENT_PATH = os.getenv("AGENT_PATH")
+EA_MQL_FILE = os.path.join(MT5_PATH, os.getenv("EA_MQ5_SUBPATH"))
+METAEDITOR = os.path.join(MT5_PATH, os.getenv("METAEDITOR_SUBPATH"))
+result = compile_ea(EA_MQL_FILE, METAEDITOR)
 
+#  generate ini
 ini_file = update_ini_file(
     ini_path="tester.ini",
     login=os.getenv("MT5_LOGIN"),
@@ -193,20 +264,17 @@ ini_file = update_ini_file(
     }
 )
 
-TERMINAL_PATH = os.getenv("TERMINAL_PATH")
+TERMINAL_PATH = os.path.join(MT5_PATH, os.getenv("TERMINAL_SUBPATH"))
+BACKTEST_REPORT_PATH = AGENT_PATH
+BACKTEST_LOG_PATH = os.path.join(AGENT_PATH, os.getenv("BACKTEST_LOG_SUBPATH"))
 print("TERMINAL_PATH:", TERMINAL_PATH)
-EA_EX_FILE = os.getenv("EA_EX_FILE")
-print("EA_EX_FILE:", EA_EX_FILE)
-COMPILE_LOG_FILE = os.getenv("COMPILE_LOG_FILE")
-print("COMPILE_LOG_FILE:", COMPILE_LOG_FILE)
-# EA_INI_PATH = os.getenv("EA_INI_PATH")
-BACKTEST_REPORT_PATH = os.getenv("BACKTEST_REPORT_PATH")
-BACKTEST_LOG_PATH = os.getenv("BACKTEST_LOG_PATH")
 print("BACKTEST_REPORT_PATH:", BACKTEST_REPORT_PATH)
 print("BACKTEST_LOG_PATH:", BACKTEST_LOG_PATH)
 
-report_file, log_file = run_mt5_backtest(ini_file, TERMINAL_PATH, BACKTEST_REPORT_PATH, BACKTEST_LOG_PATH, False, 30)
+# perform backtest
+report_file, log_file = run_mt5_backtest(ini_file, TERMINAL_PATH, BACKTEST_REPORT_PATH, BACKTEST_LOG_PATH, ".\logs", False, 30)
 print("report_file:", report_file)
 print("log_file:", log_file)
-df = parse_backtest_report(report_file)
-print(df.head())
+if report_file and os.path.exists( report_file):
+    df = parse_backtest_report(report_file)
+    print(df.head())

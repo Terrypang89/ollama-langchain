@@ -2,8 +2,20 @@ langchain
 langchain-ollama
 langchain-community
 langchain_text_splitters
+sqlite3
 streamlit
 re
 chardet
 faiss-cpu
 dotenv
+subprocess
+os
+pathlib
+dotenv
+datetime
+pandas
+time
+psutil  # install with pip if needed
+shutil
+glob
+Path

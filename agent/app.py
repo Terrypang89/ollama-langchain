@@ -1,9 +1,20 @@
 import streamlit as st
+from dotenv import load_dotenv
 from pathlib import Path
 from pipeline import run_pipeline, get_artifacts_by_version
-
+from langchain_community.vectorstores import FAISS
+import os
+from langchain_ollama import OllamaEmbeddings, OllamaLLM
 # Import your pipeline functions
 # from pipeline import run_pipeline, get_artifacts_by_version, record_pipeline_version
+
+load_dotenv()
+OLLAMA_SERVER = os.getenv("OLLAMA_API_BASE")
+
+embeddings = OllamaEmbeddings(
+    model="nomic-embed-text",
+    base_url=f"{OLLAMA_SERVER}"
+)
 
 st.title("EA Refinement Dashboard")
 
@@ -35,7 +46,7 @@ if selected_log:
     if st.button("Run Pipeline with Selected Log"):
         # Pass log_text into your pipeline
         run_pipeline(
-            vectorstore=None,
+            vectorstore=FAISS.from_texts(chunks, embeddings),
             ollama_model="ollama_model",
             ea_file="ExpertAdvisor.mq5",
             header_files=["header1.mqh", "header2.mqh"],

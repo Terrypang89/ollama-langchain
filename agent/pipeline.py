@@ -1,16 +1,13 @@
 import subprocess
-import Path
+from pathlib import Path
 import os
 import sqlite3
 from datetime import datetime
 from dotenv import load_dotenv
-from langchain.llms import Ollama
+# from langchain.llms import Ollama
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_ollama import OllamaEmbeddings, OllamaLLM
-# from langchain.text_splitter import RecursiveCharacterTextSplitter
-# from langchain.vectorstores import FAISS
-# from langchain.embeddings import OllamaEmbeddings
 
 load_dotenv()
 OLLAMA_SERVER = os.getenv("OLLAMA_API_BASE")
@@ -172,7 +169,7 @@ def refine_code_with_analysis(
     """
 
     # --- Call Ollama with chosen model ---
-    llm = Ollama(model=ollama_model, base_url="http://localhost:11434")
+    llm = OllamaLLM(model=ollama_model, base_url="http://localhost:11434")
     response = llm(prompt)
 
     # --- Parse response ---
@@ -300,9 +297,9 @@ def run_pipeline(vectorstore, ollama_model, ea_file, header_files, set_file, log
     latest_log, previous_log = get_last_two_logs(vectorstore)
 
     # Step 4: Refine code with analysis + user guidance
-    # refined_code, verdict = refine_code_with_analysis(
-    #     ollama_model, latest_log, ea_code, user_prompt, previous_log, version_id
-    # )
+    refined_code, verdict = refine_code_with_analysis(
+        ollama_model, latest_log, ea_code, user_prompt, previous_log, version_id
+    )
 
     refined_code, verdict, analysis_text = refine_code_with_analysis(
         ollama_model=ollama_model,
