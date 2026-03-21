@@ -1,5 +1,6 @@
 import subprocess
 import os
+import configparser
 from pathlib import Path
 from dotenv import load_dotenv
 from datetime import datetime
@@ -8,8 +9,14 @@ import time
 import psutil  # install with pip if needed
 import shutil
 import glob
+import json
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
+from langchain_ollama import OllamaEmbeddings, OllamaLLM
+from langchain_core.documents import Document
 
 load_dotenv()
+OLLAMA_SERVER = os.getenv("OLLAMA_API_BASE")
 
 class JSONMemory:
     def __init__(self, path="memory.json"):
@@ -40,6 +47,7 @@ def compile_ea(mq5_file, metaeditor_path):
     mq5_file: path to your .mq5 file
     metaeditor_path: path to MetaEditor.exe (usually in MT5 installation folder)
     """
+    print("start compile EA ", mq5_file," ...")
     mq5_file = Path(mq5_file).resolve()
     cmd = [
         metaeditor_path,
@@ -47,15 +55,15 @@ def compile_ea(mq5_file, metaeditor_path):
         "/log"
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
-    print("Compiler stdout:", result.stdout)
-    print("Compiler stderr:", result.stderr)
-
+    # print("Compiler stdout:", result.stdout)
+    # print("Compiler stderr:", result.stderr)
+    print("done comepile EA. ")
     # Check MetaEditor log file
     log_dir = Path(metaeditor_path).parent / "logs"
     log_file = log_dir / "MetaEditor.log"
-    if log_file.exists():
-        print("MetaEditor log:")
-        print(log_file.read_text(encoding="utf-8", errors="ignore"))
+    # if log_file.exists():
+    #     print("MetaEditor log:")
+    #     print(log_file.read_text(encoding="utf-8", errors="ignore"))
 
     return result.returncode == 0
 
@@ -168,6 +176,7 @@ def run_mt5_backtest(config_path, terminal_path, report_path, log_path, store_pa
             except Exception:
                 pass
 
+    print("start backtesting using ", terminal_path ," ...")    
     # --- Build command ---
     cmd = [terminal_path, "/portable", f"/config:{config_path}"] if portable_enable \
           else [terminal_path, f"/config:{config_path}"]
@@ -178,6 +187,8 @@ def run_mt5_backtest(config_path, terminal_path, report_path, log_path, store_pa
     except subprocess.TimeoutExpired:
         proc.kill()
         stdout, stderr = proc.communicate()
+
+    print("done ", timeout, " kill backtest ...")
 
     # --- Find latest log file after run ---
     latest_log_file = None
@@ -219,50 +230,75 @@ def run_mt5_backtest(config_path, terminal_path, report_path, log_path, store_pa
 
     return run_id, archive_folder, report_file, latest_log_file
 
+# def parse_backtest_report(report_file):
+#     """
+#     Parse MT5 backtest HTML report into a DataFrame.
+#     """
+#     if not report_file or not os.path.exists(report_file):
+#         raise FileNotFoundError(f"Report file not found or empty: {report_file}")
+
+#     tables = pd.read_html(report_file)
+#     if not tables:
+#         raise ValueError("Report file is empty or contains no tables")
+
+#     return tables[0]  
+
 def parse_backtest_report(report_file):
     """
-    Parse MT5 backtest HTML report into a DataFrame.
+    Parse a MetaTrader backtest report file and extract summary metrics.
+    Adjust parsing logic depending on whether it's HTML, XML, or CSV.
     """
-    if not report_file or not os.path.exists(report_file):
-        raise FileNotFoundError(f"Report file not found or empty: {report_file}")
+    summary = {}
+    with open(report_file, "r", encoding="utf-8", errors="ignore") as f:
+        content = f.read()
 
-    tables = pd.read_html(report_file)
-    if not tables:
-        raise ValueError("Report file is empty or contains no tables")
+    # Example: simple regex or string search
+    # (replace with proper parsing depending on report format)
+    if "Total trades" in content:
+        summary["trades"] = int(content.split("Total trades")[1].split()[0])
+    if "Profit" in content:
+        summary["profit"] = float(content.split("Profit")[1].split()[0])
+    if "Drawdown" in content:
+        summary["drawdown"] = float(content.split("Drawdown")[1].split()[0])
+    if "Profit Factor" in content:
+        summary["profit_factor"] = float(content.split("Profit Factor")[1].split()[0])
 
-    return tables[0]  
+    return summary
+
+def load_params_from_ini(ini_file):
+    """
+    Load parameters from an INI file into a dict.
+    """
+    config = configparser.ConfigParser()
+    config.read(ini_file)
+
+    # Assume parameters are under a section called [Parameters]
+    params = dict(config["Tester"])
+    return params
 
 def save_run_metadata(run_id, ea_name, parameters, archive_folder,
-                      report_files, log_file, compiled_file,
-                      summary_metrics, vector_ids):
+                      report_files, log_file, compiled_file, vector_ids, summary):
     """
-    Build and save metadata.json for a backtest run.
-    Stores only run details in archive_folder, no Git involved.
+    Save run metadata into metadata.json inside archive folder.
+    Parameters are loaded from ini file.
     """
-
     metadata = {
         "run_id": run_id,
-        "timestamp": datetime.now().isoformat(),
         "ea_name": ea_name,
-        "parameters": parameters,
-        "artifacts": {
-            "archive_folder": archive_folder,
-            "compiled_file": compiled_file,
-            "report_variants": report_files,
-            "log_file": log_file
-        },
-        "vector_db": vector_ids,
-        "summary": summary_metrics
+        "parameters": parameters,   # dict from ini file
+        "archive_folder": archive_folder,
+        "report_files": report_files,
+        "log_file": log_file,
+        "compiled_file": compiled_file,
+        "vector_ids": vector_ids,
+        "summary": summary            # dict from parse_backtest_report
     }
 
-    # Save metadata.json into archive folder
-    os.makedirs(archive_folder, exist_ok=True)
     metadata_path = os.path.join(archive_folder, "metadata.json")
-    with open(metadata_path, "w") as f:
+    with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=4)
 
-    print(f"Metadata saved to {metadata_path}")
-    return metadata_path
+    print(f"Saved metadata.json for run {run_id}")
 
 def save_run_and_update_memory(run_id, ea_name, parameters, archive_folder,
                                report_files, log_file, compiled_file,
@@ -316,28 +352,67 @@ def save_run_and_update_memory(run_id, ea_name, parameters, archive_folder,
 
     return metadata_path
 
-def process_run_for_embeddings(run_id, archive_folder, ea_source_file, log_file, report_file, header_files=None):
-    """
-    Embed MQ5 source, header files, log, and report into vector DB and return IDs.
-    """
-    vector_db_path = "./vector_index"
+def embed_and_store(file_path, vector_db_path, doc_type, run_id):
+    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+        text = f.read()
 
-    # EA source
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+    docs = splitter.create_documents([text])
+
+    for d in docs:
+        d.metadata = {"run_id": run_id, "doc_type": doc_type}
+
+    embeddings = OllamaEmbeddings(
+        model="nomic-embed-text",
+        base_url=f"{OLLAMA_SERVER}"
+    )
+
+    # Ensure vector_db_path exists
+    os.makedirs(vector_db_path, exist_ok=True)
+
+    index_file = os.path.join(vector_db_path, "index.faiss")
+    if os.path.exists(index_file):
+        # Load existing FAISS index safely
+        db = FAISS.load_local(vector_db_path, embeddings, allow_dangerous_deserialization=True)
+        db.add_documents(docs)
+    else:
+        # Create new FAISS index from docs
+        db = FAISS.from_documents(docs, embeddings)
+
+    db.save_local(vector_db_path)
+
+    return f"{doc_type}_{run_id}"
+
+import os
+
+def process_run_for_embeddings(run_id, archive_folder, ea_source_file, log_file, report_file, header_files=None):
+    vector_db_path = "files_index"
+
+    print("storing ea_source_file =", ea_source_file, "...")
     code_id = embed_and_store(ea_source_file, vector_db_path, "code", run_id)
 
-    # Headers (optional list of .mqh files)
     header_ids = []
     if header_files:
         for hf in header_files:
+            print("storing header =", hf, "...")
             hid = embed_and_store(hf, vector_db_path, "header", run_id)
             header_ids.append(hid)
 
-    # Log
-    log_id = embed_and_store(log_file, vector_db_path, "log", run_id)
+    log_id = None
+    if log_file and os.path.exists(log_file):
+        print("storing log_file =", log_file, "...")
+        log_id = embed_and_store(log_file, vector_db_path, "log", run_id)
+    else:
+        print("log_file not found, skipping...")
 
-    # Report
-    report_id = embed_and_store(report_file, vector_db_path, "report", run_id)
+    report_id = None
+    if report_file and os.path.exists(report_file):
+        print("storing report_file =", report_file, "...")
+        report_id = embed_and_store(report_file, vector_db_path, "report", run_id)
+    else:
+        print("report_file not found, skipping...")
 
+    print("done storing to vector at", vector_db_path)
     return {
         "code_embedding_id": code_id,
         "header_embedding_ids": header_ids,
@@ -360,7 +435,16 @@ def get_last_run_info():
         }
     }
 
-def query_last_run_snippets(query_text, vector_db_path="./vector_index", top_k=3):
+def query_run_snippets(run_id, query_text, vector_db_path="files_index", top_k=3):
+    embeddings = OllamaEmbeddings(
+        model="nomic-embed-text",
+        base_url=f"{OLLAMA_SERVER}"
+    )
+    db = FAISS.load_local(vector_db_path, embeddings, allow_dangerous_deserialization=True)
+    results = db.similarity_search(query_text, k=top_k)
+    return [r for r in results if r.metadata.get("run_id") == run_id]
+
+def query_last_run_snippets(query_text, vector_db_path="files_index", top_k=3, doc_type=None):
     info = get_last_run_info()
     run_id = info["run_id"]
 
@@ -368,11 +452,14 @@ def query_last_run_snippets(query_text, vector_db_path="./vector_index", top_k=3
         model="nomic-embed-text",
         base_url=f"{OLLAMA_SERVER}"
     )
-    db = FAISS.load_local(vector_db_path, embeddings)
+    db = FAISS.load_local(vector_db_path, embeddings, allow_dangerous_deserialization=True)
 
     results = db.similarity_search(query_text, k=top_k)
-    # Filter by run_id so you only get snippets from the latest run
-    return [r for r in results if r.metadata.get("run_id") == run_id]
+    filtered = [r for r in results if r.metadata.get("run_id") == run_id]
+    if doc_type:
+        filtered = [r for r in filtered if r.metadata.get("doc_type") == doc_type]
+    return filtered
+
 
 def suggest_code_improvements(query_text):
     # Step 1: Retrieve relevant snippets from latest run
@@ -402,83 +489,75 @@ Provide specific MQ5 code changes or refactoring ideas.
 
     return response
 
-def apply_improvements_to_git(ea_file_path, header_file_path, improvements_text,
+def apply_improvements_to_git(repo_dir, ea_file_path, header_file_path, improvements_text,
                               run_id=None,
                               commit_message="Apply MQ5 improvements",
                               mt5_mql5_folder=None):
-    """
-    Apply suggested MQ5 improvements to EA and header files, then commit to Git.
-    If no Git repo exists, initialize one and copy MQL5 files/headers from MetaTrader folder.
-    After committing, optionally tag the commit with run_id and copy updated files
-    back into the MetaTrader MQL5 folder.
-    
-    Args:
-        ea_file_path (str): Path to the EA source file (.mq5) in your repo MQL5 folder
-        header_file_path (str): Path to the header file (.mqh) in your repo MQL5 folder
-        improvements_text (str): Suggested improvements (code changes or refactor ideas)
-        run_id (str): Optional run identifier to tag the commit
-        commit_message (str): Git commit message
-        mt5_mql5_folder (str): Path to the original MetaTrader MQL5 folder (optional)
-    """
-    repo_dir = os.path.dirname("MQL5")
 
-    # Step 1: Check if repo exists
-    git_dir = os.path.join(repo_dir, ".git")
-    if not os.path.exists(git_dir):
-        print("No Git repo found. Initializing new repo...")
+    if not os.path.exists(repo_dir):
+        os.makedirs(repo_dir)
+
+    # Ensure repo exists
+    if not os.path.exists(os.path.join(repo_dir, ".git")):
+        print(f"No Git repo found in {repo_dir}. Initializing new repo...")
         subprocess.run(["git", "init"], cwd=repo_dir)
 
-        if not os.path.exists(ea_file_path):
-            os.makedirs(ea_file_path)
-        
-        if not os.path.exists(header_file_path):
-            os.makedirs(header_file_path)
-
-        # Copy MQL5 files from MetaTrader folder if provided
-        if mt5_mql5_folder:
-            for subfolder in ["Experts", "Include"]:  # include headers too
-                if subfolder is "Experts":
-                    src = os.path.join(mt5_mql5_folder, ea_file_path)
-                    dest = ea_file_path
-                else if subfolder is "Include":
-                    src = os.path.join(mt5_mql5_folder, header_file_path)
-                    dest = header_file_path
-                if os.path.exists(src):
-                    shutil.copytree(src, dest, dirs_exist_ok=True)
-                    print(f"Copied {src} to  {dest} to repo.")
-
-    # Step 2: Append improvements as comments to EA file
+    # Append improvements
     with open(ea_file_path, "a", encoding="utf-8") as f:
         f.write("\n// --- Suggested Improvements ---\n")
         f.write("// " + improvements_text.replace("\n", "\n// ") + "\n")
 
-    # Step 3: Append improvements as comments to header file
     if header_file_path and os.path.exists(header_file_path):
         with open(header_file_path, "a", encoding="utf-8") as f:
             f.write("\n// --- Suggested Improvements ---\n")
             f.write("// " + improvements_text.replace("\n", "\n// ") + "\n")
 
-    # Step 4: Commit changes to Git
+    # Build commit message: run_id + ":" + commit_message
+    if run_id:
+        full_commit_message = f"{run_id}:{commit_message}"
+    else:
+        full_commit_message = commit_message
+
+    # Commit changes
     subprocess.run(["git", "add", "."], cwd=repo_dir)
-    subprocess.run(["git", "commit", "-m", commit_message], cwd=repo_dir)
+    subprocess.run(["git", "commit", "-m", full_commit_message], cwd=repo_dir)
 
-    print(f"Improvements applied and committed: {commit_message}")
+    print(f"Improvements applied and committed: {full_commit_message}")
 
-    # Step 5: Tag commit with run_id if provided
+    # Tag commit with run_id if provided
     if run_id:
         subprocess.run(["git", "tag", run_id], cwd=repo_dir)
         print(f"Tagged commit with run_id: {run_id}")
 
-    # Step 6: Copy updated files back into MetaTrader MQL5 folder
-    if mt5_mql5_folder:
-        experts_dest = os.path.join(mt5_mql5_folder, "Experts", os.path.basename(ea_file_path))
-        shutil.copy2(ea_file_path, experts_dest)
-        print(f"Copied updated EA file to MetaTrader folder: {experts_dest}")
+    # Return the commit message string
+    return full_commit_message
 
-        if header_file_path:
-            include_dest = os.path.join(mt5_mql5_folder, "Include", os.path.basename(header_file_path))
-            shutil.copy2(header_file_path, include_dest)
-            print(f"Copied updated header file to MetaTrader folder: {include_dest}")
+import os, json, subprocess
+
+def record_git_commit_to_metadata_and_memory(run_id, commit_hash, repo_dir, archive_folder):
+    """
+    Record the latest Git commit hash into metadata.json and memory.json.
+    """
+    # Update metadata.json
+    metadata_path = os.path.join(archive_folder, "metadata.json")
+    if os.path.exists(metadata_path):
+        with open(metadata_path, "r", encoding="utf-8") as f:
+            metadata = json.load(f)
+    else:
+        metadata = {}
+
+    metadata["git_commit_hash"] = commit_hash
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=4)
+
+    # Update memory.json
+    ltm = JSONMemory(path="memory.json")
+    ltm.store("LAST_RUN_ID", run_id)
+    ltm.store("LAST_RUN_GIT_COMMIT", commit_hash)
+
+    print(f"Recorded commit {commit_hash} for run {run_id}")
+    return commit_hash
+
 
 def record_commit_to_metadata(run_id, archive_folder, commit_message, summary_metrics, vector_ids):
     """
@@ -523,11 +602,34 @@ def record_commit_to_metadata(run_id, archive_folder, commit_message, summary_me
 
 
 # compile EA
+EA_NAME = os.getenv("EA_NAME")
+EA_EX_NAME = os.getenv("EA_EX_NAME")
 MT5_PATH = os.getenv("MT5_PATH")
 AGENT_PATH = os.getenv("AGENT_PATH")
-EA_MQL_FILE = os.path.join(MT5_PATH, os.getenv("EA_MQ5_SUBPATH"))
-HEADER_MQL_FILE = os.path.join(MT5_PATH, os.getenv("EA_HEADER_SUBPATH"))
+
+EA_MQ5_SUBPATH = os.getenv("EA_MQ5_SUBPATH")
+EA_HEADER_SUBPATH = os.getenv("EA_HEADER_SUBPATH")
+EA_MQL_FILE = os.path.join(AGENT_PATH, EA_MQ5_SUBPATH)
+HEADER_MQL_FILE = os.path.join(AGENT_PATH, EA_HEADER_SUBPATH)
 METAEDITOR = os.path.join(MT5_PATH, os.getenv("METAEDITOR_SUBPATH"))
+
+TERMINAL_PATH = os.path.join(MT5_PATH, os.getenv("TERMINAL_SUBPATH"))
+BACKTEST_REPORT_PATH = AGENT_PATH
+BACKTEST_LOG_PATH = os.path.join(AGENT_PATH, os.getenv("BACKTEST_LOG_SUBPATH"))
+
+print("EA_NAME:", EA_NAME)
+print("EA_EX_NAME:", EA_EX_NAME)
+print("MT5_PATH:", MT5_PATH)
+
+print("AGENT_PATH:", AGENT_PATH)
+print("EA_MQL_FILE:", EA_MQL_FILE)
+print("HEADER_MQL_FILE:", HEADER_MQL_FILE)
+print("METAEDITOR:", METAEDITOR)
+
+print("TERMINAL_PATH:", TERMINAL_PATH)
+print("BACKTEST_REPORT_PATH:", BACKTEST_REPORT_PATH)
+print("BACKTEST_LOG_PATH:", BACKTEST_LOG_PATH)
+
 result = compile_ea(EA_MQL_FILE, METAEDITOR)
 
 #  generate ini
@@ -536,14 +638,14 @@ ini_file = update_ini_file(
     login=os.getenv("MT5_LOGIN"),
     password=os.getenv("MT5_PASSWORD"),
     server=os.getenv("MT5_SERVER"),
-    expert="Tofu_EA_Pro.ex5",
+    expert=EA_EX_NAME,
     symbol="XAUUSD",
     period="M5",
     from_date="2025.04.01",
     to_date="2025.04.05",
     report_path=r"Tester_report.html",
     updates={
-        "Expert": "Tofu_EA_Pro.ex5",
+        "Expert": EA_EX_NAME,
         "Symbol": "XAUUSD",
         "Period": "M5",
         "FromDate": "2025.05.01",
@@ -553,13 +655,6 @@ ini_file = update_ini_file(
     }
 )
 
-TERMINAL_PATH = os.path.join(MT5_PATH, os.getenv("TERMINAL_SUBPATH"))
-BACKTEST_REPORT_PATH = AGENT_PATH
-BACKTEST_LOG_PATH = os.path.join(AGENT_PATH, os.getenv("BACKTEST_LOG_SUBPATH"))
-print("TERMINAL_PATH:", TERMINAL_PATH)
-print("BACKTEST_REPORT_PATH:", BACKTEST_REPORT_PATH)
-print("BACKTEST_LOG_PATH:", BACKTEST_LOG_PATH)
-
 # perform backtest
 # report_file, log_file = run_mt5_backtest(ini_file, TERMINAL_PATH, BACKTEST_REPORT_PATH, BACKTEST_LOG_PATH, ".\logs", False, 30)
 run_id, archive_folder, report_file, log_file = run_mt5_backtest(
@@ -567,72 +662,75 @@ run_id, archive_folder, report_file, log_file = run_mt5_backtest(
     TERMINAL_PATH,
     BACKTEST_REPORT_PATH,
     BACKTEST_LOG_PATH,
-    ".\logs",
+    "logs",
     False,
     30,
 )
+print("run_id:", run_id)
+print("archive_folder:", archive_folder)
 print("report_file:", report_file)
 print("log_file:", log_file)
-if report_file and os.path.exists( report_file):
-    df = parse_backtest_report(report_file)
-    print(df.head())
 
 # generate vector id once stored to vector store
 vector_ids = process_run_for_embeddings(
     run_id=run_id,
     archive_folder=archive_folder,
     ea_source_file=EA_MQL_FILE,
-    log_file=os.path.basename(log_file),
-    report_file=[os.path.basename(report_file)]
+    log_file=log_file,
+    report_file=report_file,
     header_files=[
-        "MQL5/Include/TofyInclude.mqh",
+        HEADER_MQL_FILE,
     ]
 )
 
 # Save metadata json first after backtest
 save_run_metadata(
     run_id=run_id,
-    ea_name="Tofu_EA_Pro",
-    parameters=params,
+    ea_name=EA_NAME,
+    parameters=load_params_from_ini(ini_file),
     archive_folder=archive_folder,
     report_files=[os.path.basename(report_file)],
     log_file=os.path.basename(log_file),
-    compiled_file="Tofu_EA_Pro.ex5",
-    summary_metrics=summary,
-    vector_ids=vector_ids
+    compiled_file=EA_EX_NAME,
+    vector_ids=vector_ids,
+    summary=parse_backtest_report(report_file),
 )
 
 # merge metadata and memory json together
 metadata_path = save_run_and_update_memory(
     run_id=run_id,
-    ea_name="Tofu_EA_Pro",
-    parameters=params,
+    ea_name=EA_NAME,
+    parameters=load_params_from_ini(ini_file),
     archive_folder=archive_folder,
     report_files=[os.path.basename(report_file)],
     log_file=os.path.basename(log_file),
-    compiled_file="Tofu_EA_Pro.ex5",
-    summary_metrics=summary,
+    compiled_file=EA_EX_NAME,
+    summary_metrics=parse_backtest_report(report_file),
     vector_ids=vector_ids
 )
 
-improvements = suggest_code_improvements("trailing stop logic with drawdown > 5%")
+code_suggest = "trailing stop logic with drawdown > 5%"
+improvements = suggest_code_improvements(code_suggest)
 print("Suggested Improvements:\n", improvements)
 
-apply_improvements_to_git(
-    ea_file_path=EA_MQL_FILE,
-    header_file_path=HEADER_MQL_FILE,
+# Apply improvements and commit, returns the full commit message string
+full_commit_message = apply_improvements_to_git(
+    repo_dir="MQL5",
+    ea_file_path=EA_MQ5_SUBPATH,
+    header_file_path=EA_HEADER_SUBPATH,
     improvements_text=improvements,
     run_id=run_id,
-    commit_message="Refactor trailing stop logic",
+    commit_message=code_suggest,
     mt5_mql5_folder=AGENT_PATH
 )
 
-record_git_commit_to_metadata_and_memory(
-    run_id=run_id,
-    archive_folder=archive_folder,
-    commit_message="Refactor trailing stop + risk management",
-    summary_metrics=summary,
-    vector_ids=vector_ids,
-)
+# Get the commit hash of the commit just made
+commit_hash = subprocess.check_output(
+    ["git", "rev-parse", "HEAD"], cwd="MQL5"
+).decode().strip()
+
+# Record commit info into metadata.json and memory.json
+record_git_commit_to_metadata_and_memory(run_id, commit_hash, "MQL5", archive_folder)
+
 
 

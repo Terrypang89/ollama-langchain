@@ -1,6 +1,9 @@
 env/
-faiss_index
+files_index/
 .env
-logs
+logs/
 __pycache__
-MQL5
+MQ\\\
+memory.json
+tester.ini
+logs_index
