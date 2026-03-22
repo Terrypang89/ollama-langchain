@@ -10,13 +10,11 @@ import psutil  # install with pip if needed
 import shutil
 import glob
 import json
+import re
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_ollama import OllamaEmbeddings, OllamaLLM
-from langchain_core.documents import Document
-
-load_dotenv()
-OLLAMA_SERVER = os.getenv("OLLAMA_API_BASE")
+# from langchain_core.documents import Document
 
 class JSONMemory:
     def __init__(self, path="memory.json"):
@@ -144,6 +142,9 @@ def run_mt5_backtest(config_path, terminal_path, report_path, log_path, store_pa
     Return (report_file, latest_log_file, archive_folder).
     """
 
+    # --- Ensure store_path exists ---
+    os.makedirs(store_path, exist_ok=True)
+
     # --- Extract report path from ini file ---
     report_file = None
     with open(config_path, "r") as f:
@@ -230,40 +231,90 @@ def run_mt5_backtest(config_path, terminal_path, report_path, log_path, store_pa
 
     return run_id, archive_folder, report_file, latest_log_file
 
-# def parse_backtest_report(report_file):
-#     """
-#     Parse MT5 backtest HTML report into a DataFrame.
-#     """
-#     if not report_file or not os.path.exists(report_file):
-#         raise FileNotFoundError(f"Report file not found or empty: {report_file}")
-
-#     tables = pd.read_html(report_file)
-#     if not tables:
-#         raise ValueError("Report file is empty or contains no tables")
-
-#     return tables[0]  
-
-def parse_backtest_report(report_file):
+def report_tables_to_json(report_file, archive_folder, output_json="report_tables.json"):
     """
-    Parse a MetaTrader backtest report file and extract summary metrics.
-    Adjust parsing logic depending on whether it's HTML, XML, or CSV.
+    Read all tables from a MetaTrader backtest HTML report and save them into a JSON file
+    inside the archive folder.
     """
+    if not os.path.exists(report_file):
+        raise FileNotFoundError(f"Report file not found: {report_file}")
+
+    tables = pd.read_html(report_file)
+    if not tables:
+        raise ValueError("No tables found in report")
+
+    # Convert each DataFrame to a list of dicts
+    tables_json = {}
+    for idx, df in enumerate(tables):
+        df.columns = [str(c).strip() for c in df.columns]
+        tables_json[f"table_{idx}"] = df.to_dict(orient="records")
+
+    # Ensure archive folder exists
+    os.makedirs(archive_folder, exist_ok=True)
+
+    # Build full path for output JSON file
+    output_path = os.path.join(archive_folder, output_json)
+
+    # Save to JSON file
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(tables_json, f, indent=4)
+
+    print(f"Saved {len(tables)} tables to {output_path}")
+    return output_path
+
+def extract_number(val_str):
+    """Return the first numeric value found in a string, or None."""
+    match = re.search(r"-?\d+(\.\d+)?", val_str)
+    if match:
+        return float(match.group(0))
+    return None
+
+def parse_backtest_report(report_file_json):
+    if not os.path.exists(report_file_json):
+        raise FileNotFoundError(f"Report JSON not found: {report_file_json}")
+
+    with open(report_file_json, "r", encoding="utf-8") as f:
+        tables = json.load(f)
+
     summary = {}
-    with open(report_file, "r", encoding="utf-8", errors="ignore") as f:
-        content = f.read()
 
-    # Example: simple regex or string search
-    # (replace with proper parsing depending on report format)
-    if "Total trades" in content:
-        summary["trades"] = int(content.split("Total trades")[1].split()[0])
-    if "Profit" in content:
-        summary["profit"] = float(content.split("Profit")[1].split()[0])
-    if "Drawdown" in content:
-        summary["drawdown"] = float(content.split("Drawdown")[1].split()[0])
-    if "Profit Factor" in content:
-        summary["profit_factor"] = float(content.split("Profit Factor")[1].split()[0])
+    for tname, rows in tables.items():
+        for row in rows:
+            keys = sorted(row.keys(), key=lambda x: int(x))
+            for i in range(0, len(keys)-1, 2):
+                label = str(row[keys[i]]).strip() if row[keys[i]] and str(row[keys[i]]).lower() != "nan" else None
+                val   = str(row[keys[i+1]]).strip() if row[keys[i+1]] and str(row[keys[i+1]]).lower() != "nan" else None
+                if not label or not val:
+                    continue
+
+                num = extract_number(val)  # safely extract numeric part
+
+                if label.startswith("Total Net Profit") and num is not None:
+                    summary["net_profit"] = num
+                elif label.startswith("Gross Profit") and num is not None:
+                    summary["gross_profit"] = num
+                elif label.startswith("Gross Loss") and num is not None:
+                    summary["gross_loss"] = num
+                elif label.startswith("Profit Factor") and num is not None:
+                    summary["profit_factor"] = num
+                elif label.startswith("Expected Payoff") and num is not None:
+                    summary["expected_payoff"] = num
+                elif label.startswith("Sharpe Ratio") and num is not None:
+                    summary["sharpe_ratio"] = num
+                elif label.startswith("Total Trades") and num is not None:
+                    summary["trades"] = int(num)
+                elif label.startswith("Short Trades"):
+                    summary["short_trades"] = val
+                elif label.startswith("Long Trades"):
+                    summary["long_trades"] = val
+                elif label.startswith("Profit Trades"):
+                    summary["profit_trades"] = val
+                elif label.startswith("Loss Trades"):
+                    summary["loss_trades"] = val
 
     return summary
+
+
 
 def load_params_from_ini(ini_file):
     """
@@ -302,13 +353,10 @@ def save_run_metadata(run_id, ea_name, parameters, archive_folder,
 
 def save_run_and_update_memory(run_id, ea_name, parameters, archive_folder,
                                report_files, log_file, compiled_file,
-                               summary_metrics, vector_ids):
+                               vector_ids, summary):
     """
-    Save metadata.json into archive_folder AND update memory.json with latest run info.
-    Also append run details into a RUN_HISTORY list.
+    Save run metadata into metadata.json and update memory.json with latest run info.
     """
-
-    # --- Build metadata dictionary ---
     metadata = {
         "run_id": run_id,
         "timestamp": datetime.now().isoformat(),
@@ -318,41 +366,35 @@ def save_run_and_update_memory(run_id, ea_name, parameters, archive_folder,
             "archive_folder": archive_folder,
             "compiled_file": compiled_file,
             "report_variants": report_files,
-            "log_file": log_file
+            "log_file": log_file,
         },
         "vector_db": vector_ids,
-        "summary": summary_metrics
+        "summary": summary,
     }
 
-    # --- Save metadata.json into archive folder ---
-    os.makedirs(archive_folder, exist_ok=True)
+    # Save metadata.json inside archive folder
     metadata_path = os.path.join(archive_folder, "metadata.json")
-    with open(metadata_path, "w") as f:
+    with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=4)
 
-    print(f"Metadata saved to {metadata_path}")
-
-    # --- Update memory.json ---
+    # Update memory.json
     ltm = JSONMemory(path="memory.json")
-
-    # Store latest run info
     ltm.store("LAST_RUN_ID", run_id)
     ltm.store("LAST_RUN_EA", ea_name)
     ltm.store("LAST_RUN_ARCHIVE", archive_folder)
+    ltm.store("LAST_RUN_CODE_EMBEDDING_ID", vector_ids.get("code_embedding_id"))
+    ltm.store("LAST_HEADER_EMBEDDING_IDS", vector_ids.get("header_embedding_ids"))
+    ltm.store("LAST_RUN_LOG_EMBEDDING_ID", vector_ids.get("log_embedding_id"))
+    ltm.store("LAST_RUN_REPORT_EMBEDDING_ID", vector_ids.get("report_embedding_id"))
 
-    for key, value in vector_ids.items():
-        ltm.store(f"LAST_RUN_{key.upper()}", value)
-
-    # Append to run history
+    # Insert newest run at the top of history
     history = ltm.get("RUN_HISTORY") or []
-    history.append(metadata)
+    history.insert(0, metadata)   # instead of append
     ltm.store("RUN_HISTORY", history)
 
-    print(f"Updated memory.json with latest run {run_id} and appended to history.")
+    print(f"Saved run {run_id} and updated memory.json")
 
-    return metadata_path
-
-def embed_and_store(file_path, vector_db_path, doc_type, run_id):
+def embed_and_store(ollama_server, file_path, vector_db_path, doc_type, run_id):
     with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
         text = f.read()
 
@@ -364,7 +406,7 @@ def embed_and_store(file_path, vector_db_path, doc_type, run_id):
 
     embeddings = OllamaEmbeddings(
         model="nomic-embed-text",
-        base_url=f"{OLLAMA_SERVER}"
+        base_url=f"{ollama_server}"
     )
 
     # Ensure vector_db_path exists
@@ -383,32 +425,30 @@ def embed_and_store(file_path, vector_db_path, doc_type, run_id):
 
     return f"{doc_type}_{run_id}"
 
-import os
-
-def process_run_for_embeddings(run_id, archive_folder, ea_source_file, log_file, report_file, header_files=None):
+def process_run_for_embeddings(ollama_server, run_id, archive_folder, ea_source_file, log_file, report_file, header_files=None):
     vector_db_path = "files_index"
 
     print("storing ea_source_file =", ea_source_file, "...")
-    code_id = embed_and_store(ea_source_file, vector_db_path, "code", run_id)
+    code_id = embed_and_store(ollama_server, ea_source_file, vector_db_path, "code", run_id)
 
     header_ids = []
     if header_files:
         for hf in header_files:
             print("storing header =", hf, "...")
-            hid = embed_and_store(hf, vector_db_path, "header", run_id)
+            hid = embed_and_store(ollama_server, hf, vector_db_path, "header", run_id)
             header_ids.append(hid)
 
     log_id = None
     if log_file and os.path.exists(log_file):
         print("storing log_file =", log_file, "...")
-        log_id = embed_and_store(log_file, vector_db_path, "log", run_id)
+        log_id = embed_and_store(ollama_server, log_file, vector_db_path, "log", run_id)
     else:
         print("log_file not found, skipping...")
 
     report_id = None
     if report_file and os.path.exists(report_file):
         print("storing report_file =", report_file, "...")
-        report_id = embed_and_store(report_file, vector_db_path, "report", run_id)
+        report_id = embed_and_store(ollama_server, report_file, vector_db_path, "report", run_id)
     else:
         print("report_file not found, skipping...")
 
@@ -435,22 +475,22 @@ def get_last_run_info():
         }
     }
 
-def query_run_snippets(run_id, query_text, vector_db_path="files_index", top_k=3):
+def query_run_snippets(ollama_server, run_id, query_text, vector_db_path="files_index", top_k=3):
     embeddings = OllamaEmbeddings(
         model="nomic-embed-text",
-        base_url=f"{OLLAMA_SERVER}"
+        base_url=f"{ollama_server}"
     )
     db = FAISS.load_local(vector_db_path, embeddings, allow_dangerous_deserialization=True)
     results = db.similarity_search(query_text, k=top_k)
     return [r for r in results if r.metadata.get("run_id") == run_id]
 
-def query_last_run_snippets(query_text, vector_db_path="files_index", top_k=3, doc_type=None):
+def query_last_run_snippets(ollama_server, query_text, vector_db_path="files_index", top_k=3, doc_type=None):
     info = get_last_run_info()
     run_id = info["run_id"]
 
     embeddings = OllamaEmbeddings(
         model="nomic-embed-text",
-        base_url=f"{OLLAMA_SERVER}"
+        base_url=f"{ollama_server}"
     )
     db = FAISS.load_local(vector_db_path, embeddings, allow_dangerous_deserialization=True)
 
@@ -461,9 +501,9 @@ def query_last_run_snippets(query_text, vector_db_path="files_index", top_k=3, d
     return filtered
 
 
-def suggest_code_improvements(query_text):
+def suggest_code_improvements(ollama_server, query_text):
     # Step 1: Retrieve relevant snippets from latest run
-    snippets = query_last_run_snippets(query_text)
+    snippets = query_last_run_snippets(ollama_server, query_text)
 
     # Step 2: Build context for the model
     context = "\n\n".join([
@@ -502,10 +542,31 @@ def apply_improvements_to_git(repo_dir, ea_file_path, header_file_path, improvem
         print(f"No Git repo found in {repo_dir}. Initializing new repo...")
         subprocess.run(["git", "init"], cwd=repo_dir)
 
+        # wheck file path exist
+        if not os.path.exists(os.path.dirname(ea_file_path)):
+            os.makedirs(os.path.dirname(ea_file_path))
+            mql5_folder_ea_file = os.path.join(mt5_mql5_folder, ea_file_path)
+            print("copy files:", mql5_folder_ea_file, " to ", ea_file_path)
+            if os.path.isfile(mql5_folder_ea_file):
+                shutil.copy(mql5_folder_ea_file, ea_file_path)
+
+        if not os.path.exists(os.path.dirname(header_file_path)):
+            os.makedirs(os.path.dirname(header_file_path))
+            mql5_folder_header_file = os.path.join(mt5_mql5_folder, header_file_path)
+            print("copy files:", mql5_folder_header_file, " to ", header_file_path)
+            if os.path.isfile(mql5_folder_header_file):
+                shutil.copy(mql5_folder_header_file, header_file_path)
+
+        if os.path.exists(ea_file_path) and os.path.exists(header_file_path):
+            commit_message = "init with " + ea_file_path + " && " + header_file_path
+        else:
+            commit_message = " init with none."
+
     # Append improvements
-    with open(ea_file_path, "a", encoding="utf-8") as f:
-        f.write("\n// --- Suggested Improvements ---\n")
-        f.write("// " + improvements_text.replace("\n", "\n// ") + "\n")
+    if ea_file_path and os.path.exists(ea_file_path):
+        with open(ea_file_path, "a", encoding="utf-8") as f:
+            f.write("\n// --- Suggested Improvements ---\n")
+            f.write("// " + improvements_text.replace("\n", "\n// ") + "\n")
 
     if header_file_path and os.path.exists(header_file_path):
         with open(header_file_path, "a", encoding="utf-8") as f:
@@ -532,8 +593,6 @@ def apply_improvements_to_git(repo_dir, ea_file_path, header_file_path, improvem
     # Return the commit message string
     return full_commit_message
 
-import os, json, subprocess
-
 def record_git_commit_to_metadata_and_memory(run_id, commit_hash, repo_dir, archive_folder):
     """
     Record the latest Git commit hash into metadata.json and memory.json.
@@ -558,48 +617,8 @@ def record_git_commit_to_metadata_and_memory(run_id, commit_hash, repo_dir, arch
     print(f"Recorded commit {commit_hash} for run {run_id}")
     return commit_hash
 
-
-def record_commit_to_metadata(run_id, archive_folder, commit_message, summary_metrics, vector_ids):
-    """
-    Record Git commit info into metadata.json in archive folder and update memory.json.
-    """
-    # Get latest commit hash
-    repo_dir = os.path.dirname(archive_folder)  # adjust if repo lives elsewhere
-    commit_hash = subprocess.check_output(
-        ["git", "rev-parse", "HEAD"], cwd=repo_dir
-    ).decode("utf-8").strip()
-
-    # --- Update metadata.json in archive ---
-    metadata_path = os.path.join(archive_folder, "metadata.json")
-    if os.path.exists(metadata_path):
-        with open(metadata_path, "r") as f:
-            metadata = json.load(f)
-    else:
-        metadata = {}
-
-    metadata["git_commit"] = commit_hash
-    metadata["commit_message"] = commit_message
-    metadata["run_id"] = run_id
-    metadata["summary"] = summary_metrics
-    metadata["vector_db"] = vector_ids
-
-    with open(metadata_path, "w") as f:
-        json.dump(metadata, f, indent=4)
-
-    print(f"Updated metadata.json with commit {commit_hash}")
-
-    # --- Update memory.json ---
-    ltm = JSONMemory(path="memory.json")
-    ltm.store("LAST_RUN_ID", run_id)
-    ltm.store("LAST_RUN_ARCHIVE", archive_folder)
-    ltm.store("LAST_RUN_COMMIT", commit_hash)
-
-    history = ltm.get("RUN_HISTORY") or []
-    history.append(metadata)
-    ltm.store("RUN_HISTORY", history)
-
-    print(f"Updated memory.json with commit {commit_hash} for run {run_id}")
-
+load_dotenv()
+OLLAMA_SERVER = os.getenv("OLLAMA_API_BASE")
 
 # compile EA
 EA_NAME = os.getenv("EA_NAME")
@@ -656,7 +675,6 @@ ini_file = update_ini_file(
 )
 
 # perform backtest
-# report_file, log_file = run_mt5_backtest(ini_file, TERMINAL_PATH, BACKTEST_REPORT_PATH, BACKTEST_LOG_PATH, ".\logs", False, 30)
 run_id, archive_folder, report_file, log_file = run_mt5_backtest(
     ini_file,
     TERMINAL_PATH,
@@ -671,8 +689,15 @@ print("archive_folder:", archive_folder)
 print("report_file:", report_file)
 print("log_file:", log_file)
 
+json_report_file = report_tables_to_json(
+    report_file, 
+    archive_folder=archive_folder,
+    output_json="report_tables.json",
+)
+
 # generate vector id once stored to vector store
 vector_ids = process_run_for_embeddings(
+    ollama_server=OLLAMA_SERVER,
     run_id=run_id,
     archive_folder=archive_folder,
     ea_source_file=EA_MQL_FILE,
@@ -681,19 +706,6 @@ vector_ids = process_run_for_embeddings(
     header_files=[
         HEADER_MQL_FILE,
     ]
-)
-
-# Save metadata json first after backtest
-save_run_metadata(
-    run_id=run_id,
-    ea_name=EA_NAME,
-    parameters=load_params_from_ini(ini_file),
-    archive_folder=archive_folder,
-    report_files=[os.path.basename(report_file)],
-    log_file=os.path.basename(log_file),
-    compiled_file=EA_EX_NAME,
-    vector_ids=vector_ids,
-    summary=parse_backtest_report(report_file),
 )
 
 # merge metadata and memory json together
@@ -705,12 +717,12 @@ metadata_path = save_run_and_update_memory(
     report_files=[os.path.basename(report_file)],
     log_file=os.path.basename(log_file),
     compiled_file=EA_EX_NAME,
-    summary_metrics=parse_backtest_report(report_file),
-    vector_ids=vector_ids
+    vector_ids=vector_ids,
+    summary=parse_backtest_report(json_report_file),
 )
 
 code_suggest = "trailing stop logic with drawdown > 5%"
-improvements = suggest_code_improvements(code_suggest)
+improvements = suggest_code_improvements(OLLAMA_SERVER, code_suggest)
 print("Suggested Improvements:\n", improvements)
 
 # Apply improvements and commit, returns the full commit message string
