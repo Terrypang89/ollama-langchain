@@ -14,7 +14,6 @@ import re
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_ollama import OllamaEmbeddings, OllamaLLM
-# from langchain_core.documents import Document
 
 class JSONMemory:
     def __init__(self, path="memory.json"):
@@ -38,6 +37,21 @@ class JSONMemory:
     def _save(self, data):
         with open(self.path, "w") as f:
             json.dump(data, f, indent=2)
+
+def copyfiles(mq5_file, header_file, mql5_path):
+
+    if os.path.exists(mq5_file) and os.path.exists(header_file):
+        if os.path.isfile(mq5_file):
+            mql5_ea_file = os.path.join(mql5_path, mq5_file)
+            if os.path.exists(mql5_ea_file):
+                shutil.copy(mq5_file, mql5_ea_file)
+                print("copied ", mq5_file, " to ", mql5_ea_file)
+
+        if os.path.isfile(header_file):
+            mql5_header_file = os.path.join(mql5_path, header_file)
+            if os.path.exists(mql5_header_file):
+                shutil.copy(header_file, mql5_header_file)
+                print("copied ", header_file, " to ", mql5_header_file)
 
 def compile_ea(mq5_file, metaeditor_path):
     """
@@ -313,8 +327,6 @@ def parse_backtest_report(report_file_json):
                     summary["loss_trades"] = val
 
     return summary
-
-
 
 def load_params_from_ini(ini_file):
     """
@@ -648,6 +660,9 @@ print("METAEDITOR:", METAEDITOR)
 print("TERMINAL_PATH:", TERMINAL_PATH)
 print("BACKTEST_REPORT_PATH:", BACKTEST_REPORT_PATH)
 print("BACKTEST_LOG_PATH:", BACKTEST_LOG_PATH)
+print("start operation =============================================================================")
+
+# copyfiles(EA_MQ5_SUBPATH, EA_HEADER_SUBPATH, AGENT_PATH)
 
 result = compile_ea(EA_MQL_FILE, METAEDITOR)
 
