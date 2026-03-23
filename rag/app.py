@@ -4,13 +4,162 @@ import difflib
 import os
 from dotenv import load_dotenv
 from langchain_ollama import OllamaLLM
+from testMT5 import update_ini_file, run_mt5_backtest, compile_ea, safe_read_file, report_tables_to_json, parse_backtest_report, process_run_for_embeddings, save_run_and_update_memory, generate_patch_from_git, query_last_run_snippets
 
 load_dotenv()
 OLLAMA_SERVER = os.getenv("OLLAMA_API_BASE")
 ollama_model = OllamaLLM(model="mistral:7b", base_url=OLLAMA_SERVER)
 
 def preview_improvements(old_code_file, code_repo, improvements, commit_message):
-    st.title("Backtest Improvements Review")
+    st.title("Backtest EA Review")
+
+    st.subheader("Compile Expert Advisor")
+    if st.button("Compile EA"):
+        try:
+            AGENT_PATH = os.getenv("AGENT_PATH")
+            EA_MQ5_SUBPATH = os.getenv("EA_MQ5_SUBPATH")
+            EA_MQL_FILE = os.path.join(AGENT_PATH, EA_MQ5_SUBPATH)
+            MT5_PATH = os.getenv("MT5_PATH")
+            METAEDITOR = os.path.join(MT5_PATH, os.getenv("METAEDITOR_SUBPATH"))
+            result = compile_ea(EA_MQL_FILE, METAEDITOR)
+            st.success(f"EA compiled successfully: {result}")
+        except Exception as e:
+            st.error(f"Compilation failed: {e}")
+
+    # --- Run MT5 Backtest button ---
+    st.subheader("Run MT5 Backtest")
+    if st.button("Run Backtest"):
+        try:
+            # Auto-generate ini file before running backtest
+            EA_EX_NAME = os.getenv("EA_EX_NAME")
+            ini_file = update_ini_file(
+                ini_path="tester.ini",
+                login=os.getenv("MT5_LOGIN"),
+                password=os.getenv("MT5_PASSWORD"),
+                server=os.getenv("MT5_SERVER"),
+                expert=EA_EX_NAME,
+                symbol="XAUUSD",
+                period="M5",
+                from_date="2025.04.01",
+                to_date="2025.04.05",
+                report_path="Tester_report.html",
+                updates={
+                    "Expert": EA_EX_NAME,
+                    "Symbol": "XAUUSD",
+                    "Period": "M5",
+                    "FromDate": "2025.05.01",
+                    "ToDate": "2025.05.10",
+                    "Visual": False,
+                    "Report": "Tester_report.html",
+                }
+            )
+
+            # Run backtest immediately after ini generation
+            MT5_PATH = os.getenv("MT5_PATH")
+            TERMINAL_PATH = os.path.join(MT5_PATH, os.getenv("TERMINAL_SUBPATH"))
+            AGENT_PATH = os.getenv("AGENT_PATH")
+            BACKTEST_REPORT_PATH = AGENT_PATH
+            BACKTEST_LOG_PATH = os.path.join(AGENT_PATH, os.getenv("BACKTEST_LOG_SUBPATH"))
+            # add column to insert portable, timeout and visual
+            run_id, archive_folder, report_file, log_file = run_mt5_backtest(
+                config_path=ini_file,
+                terminal_path=TERMINAL_PATH,
+                report_path=BACKTEST_REPORT_PATH,
+                log_path=BACKTEST_LOG_PATH,
+                store_path="logs",
+                portable_enable=False,
+                timeout=30,
+            )
+
+            # Convert report tables to JSON
+            json_report_file = report_tables_to_json(
+                report_file,
+                archive_folder=archive_folder,
+                output_json="report_tables.json",
+            )
+
+            # Parse summary from JSON
+            summary = parse_backtest_report(json_report_file)
+
+            # Display summary nicely
+            st.subheader("Backtest Summary")
+            st.json(summary)
+
+            st.success(f"Backtest completed! Run ID: {run_id}")
+            st.write(f"Archive folder: {archive_folder}")
+            st.write(f"Report file: {report_file}")
+            st.write(f"Log file: {log_file}")
+
+             # Use safe_read_file to avoid encoding errors
+            # report_file = st.session_state.get("report_file")
+            if os.path.exists(report_file):
+                report_content = safe_read_file(report_file)
+                st.download_button("Download Report", report_content, file_name="Tester_report.html")
+            # log_file = st.session_state.get("log_file")
+            if os.path.exists(log_file):
+                log_content = safe_read_file(log_file)
+                st.download_button("Download Log", log_content, file_name="Tester_log.txt")
+
+            # Store results in session state for later use
+            st.session_state["run_id"] = run_id
+            st.session_state["archive_folder"] = archive_folder
+            st.session_state["report_file"] = report_file
+            st.session_state["log_file"] = log_file
+            st.session_state["ini_file"] = ini_file
+            st.session_state["json_report_file"] = json_report_file
+            st.session_state["summary"] = summary
+
+        except Exception as e:
+            st.error(f"Backtest failed: {e}")
+
+        
+    # --- Separate button for storing to vector store ---
+    st.subheader("Persist Run to Vector Store")
+    if st.button("Store to Vector Store"):
+        try:
+            AGENT_PATH = os.getenv("AGENT_PATH")
+            EA_MQ5_SUBPATH = os.getenv("EA_MQ5_SUBPATH")
+            EA_HEADER_SUBPATH = os.getenv("EA_HEADER_SUBPATH")
+            EA_MQL_FILE = os.path.join(AGENT_PATH, EA_MQ5_SUBPATH)
+            HEADER_MQL_FILE = os.path.join(AGENT_PATH, EA_HEADER_SUBPATH)
+
+            run_id = st.session_state.get("run_id")
+            archive_folder = st.session_state.get("archive_folder")
+            report_file = st.session_state.get("report_file")
+            log_file = st.session_state.get("log_file")
+            ini_file = st.session_state.get("ini_file")
+            json_report_file = st.session_state.get("json_report_file")
+            summary = st.session_state.get("summary")
+
+            if not all([run_id, archive_folder, report_file, log_file, ini_file, summary]):
+                st.warning("Please run a backtest first before storing to vector store.")
+            else:
+                vector_ids = process_run_for_embeddings(
+                    ollama_server=OLLAMA_SERVER,
+                    run_id=run_id,
+                    archive_folder=archive_folder,
+                    ea_source_file=EA_MQL_FILE,
+                    log_file=log_file,
+                    report_file=report_file,
+                    header_files=[HEADER_MQL_FILE],
+                )
+
+                metadata_path = save_run_and_update_memory(
+                    run_id=run_id,
+                    ea_name=EA_NAME,
+                    parameters=load_params_from_ini(ini_file),
+                    archive_folder=archive_folder,
+                    report_files=[os.path.basename(report_file)],
+                    log_file=os.path.basename(log_file),
+                    compiled_file=EA_EX_NAME,
+                    vector_ids=vector_ids,
+                    summary=summary,
+                )
+
+                st.success(f"Run stored to vector store! Metadata saved at: {metadata_path}")
+                st.write(f"Vector IDs: {vector_ids}")
+        except Exception as e:
+            st.error(f"Failed to store run to vector store: {e}")
 
     # --- Load old code from file ---
     if not os.path.exists(old_code_file):
@@ -19,29 +168,9 @@ def preview_improvements(old_code_file, code_repo, improvements, commit_message)
     with open(old_code_file, "r", encoding="utf-8") as f:
         old_code = f.read()
 
-    # --- Ensure repo is initialized ---
-    if not os.path.exists(os.path.join(code_repo, ".git")):
-        try:
-            subprocess.run(["git", "init"], cwd=code_repo, check=True)
-            # Add .gitignore to exclude patch files
-            gitignore_path = os.path.join(code_repo, ".gitignore")
-            if not os.path.exists(gitignore_path):
-                with open(gitignore_path, "w", encoding="utf-8") as gi:
-                    gi.write("*.patches\n")
-            subprocess.run(["git", "add", "."], cwd=code_repo, check=True)
-            subprocess.run(["git", "commit", "-m", "init with files " + old_code_file ], cwd=code_repo, check=True)
-            st.info("Initialized new Git repository and staged files.")
-        except subprocess.CalledProcessError as e:
-            st.error(f"Git init/add failed: {e}")
-            return
-
     # --- Improvements summary ---
     st.subheader("Proposed Improvements Summary")
     st.text_area("Improvements", improvements, height=200)
-
-    # --- Commit message editor ---
-    st.subheader("Commit Message")
-    user_commit_message = st.text_area("Commit Message", commit_message, height=100)
 
     # --- Suggestions box ---
     st.subheader("Suggest Code Changes")
@@ -50,12 +179,40 @@ def preview_improvements(old_code_file, code_repo, improvements, commit_message)
     # --- Regenerate button ---
     if st.button("Regenerate Code Changes"):
         if user_suggestions.strip() or improvements.strip():
-            prompt = f"""Here is the original code:\n{old_code}\n
-Apply these improvements:\n{improvements}\n
-And also consider these suggestions:\n{user_suggestions}\n
-Please output the full updated code without commented:"""
+#             prompt = f"""Here is the original code:\n{old_code}\n
+# Apply these improvements:\n{improvements}\n
+# And also consider these suggestions:\n{user_suggestions}\n
+# Please output the full updated code without commented:"""
 
+            # response = ollama_model.invoke(prompt)
+            # response = suggest_code_improvements(OLLAMA_SERVER, user_suggestions)
+            # code_suggest = "simplify my code"
+            snippets = query_last_run_snippets(OLLAMA_SERVER, user_suggestions)
+
+            print("snippets:", snippets)
+
+            # Step 2: Build context for the model
+            context = "\n\n".join([
+                f"[{s.metadata.get('doc_type','unknown')} snippet]\n{s.page_content}"
+                for s in snippets
+            ])
+
+            # Step 3: Send to model for improvement suggestions
+            prompt = f"""
+        You are an expert MQL5 developer. Analyze the following snippets (code, headers, logs, reports)
+        and suggest improvements to the EA source code. Specially trading strategy. 
+
+        Query: {user_suggestions}
+
+        Context:
+        {context}
+
+        Provide specific MQ5 code changes or refactoring ideas. Then output the full updated code.
+            """
+
+            ollama_model = OllamaLLM(model="mistral:7b", base_url=OLLAMA_SERVER)
             response = ollama_model.invoke(prompt)
+
             st.session_state["new_code"] = response
             st.success("Code changes regenerated using Ollama!")
         else:
@@ -69,79 +226,20 @@ Please output the full updated code without commented:"""
     with col2:
         st.code(st.session_state.get("new_code", old_code), language="python")
 
-    # --- Download patch ---
-    effective_new_code = st.session_state.get("new_code", old_code)
-    diff = list(difflib.unified_diff(
-        old_code.splitlines(),
-        effective_new_code.splitlines(),
-        fromfile=os.path.basename(old_code_file),   # "Testcode.py"
-        tofile=os.path.basename(old_code_file),     # "Testcode.py"
-        lineterm=""
-    ))
-
-    # patch_text = "\n".join(diff)
     if "new_code" in st.session_state:
         if st.button("Download Patch File"):
             try:
-                # Overwrite file with regenerated code
-                with open(old_code_file, "w", encoding="utf-8") as f:
-                    f.write(st.session_state["new_code"])
-
-                # Stage and commit
-                # subprocess.run(["git", "add", old_code_file], cwd=code_repo, check=True)
-                subprocess.run(["git", "add", os.path.basename(old_code_file)], cwd=code_repo, check=True)
-
-                subprocess.run(["git", "commit", "-m", user_commit_message], cwd=code_repo, check=True)
-                
-                patch_dir = os.path.join(code_repo, "patches")
-                if not os.path.exists(patch_dir):
-                    os.makedirs(patch_dir)
-                # subprocess.run(["git", "format-patch", "-1", "HEAD", "-o", "patches"], cwd=code_repo, check=True)
-                result = subprocess.run(
-                    ["git", "format-patch", "-1", "HEAD", "-o", "patches"],
-                    cwd=code_repo,
-                    check=True,
-                    capture_output=True,
-                    text=True
+                patch_path = generate_patch_from_git(
+                    code_repo,
+                    old_code_file,
+                    user_commit_message,
+                    st.session_state["new_code"]
                 )
-
-                # The stdout contains the filename, e.g. "0001-your-commit-message.patch\n"
-                patch_filename = result.stdout.strip()
-                patch_path = os.path.join(patch_dir, patch_filename)
-
-                # Revert back to baseline so patch can be applied later
-                subprocess.run(["git", "reset", "--hard", "HEAD~1"], cwd=code_repo, check=True)
-
-                # st.success("Patch file generated with git format-patch and repo reset to baseline!")
                 st.success(f"Patch file generated: {patch_path}")
                 st.session_state["latest_patch_path"] = patch_path
                 st.info("You can now apply it using the Apply button below.")
-            except subprocess.CalledProcessError as e:
-                st.error(f"Git error while generating patch: {e}")
-
-
-    # --- Apply button (optional hunks approval) ---
-    st.subheader("Code Diff Hunks (Approve Individually)")
-    approved_hunks = []
-    current_hunk = []
-
-    for line in diff:
-        if line.startswith("@@"):
-            if current_hunk:
-                hunk_text = "\n".join(current_hunk)
-                approve = st.checkbox(f"Approve hunk starting {current_hunk[0]}", value=True)
-                if approve:
-                    approved_hunks.append(hunk_text)
-                current_hunk = []
-            current_hunk.append(line)
-        else:
-            current_hunk.append(line)
-
-    if current_hunk:
-        hunk_text = "\n".join(current_hunk)
-        approve = st.checkbox(f"Approve hunk starting {current_hunk[0]}", value=True)
-        if approve:
-            approved_hunks.append(hunk_text)
+            except RuntimeError as e:
+                st.error(str(e))
 
     if st.button("Apply Approved Hunks to Git"):
         patch_path = st.session_state.get("latest_patch_path")

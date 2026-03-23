@@ -14,6 +14,7 @@ import re
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_ollama import OllamaEmbeddings, OllamaLLM
+import codecs
 
 class JSONMemory:
     def __init__(self, path="memory.json"):
@@ -37,6 +38,22 @@ class JSONMemory:
     def _save(self, data):
         with open(self.path, "w") as f:
             json.dump(data, f, indent=2)
+
+# Safe file read helper
+def safe_read_file(path):
+    try:
+        # Try UTF-8 first
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except UnicodeDecodeError:
+        try:
+            # Try UTF-16 (common for MT5 logs/reports)
+            with open(path, "r", encoding="utf-16") as f:
+                return f.read()
+        except UnicodeDecodeError:
+            # Fallback to latin-1 (Windows ANSI)
+            with open(path, "r", encoding="latin-1") as f:
+                return f.read()
 
 def copyfiles(mq5_file, header_file, mql5_path):
 
@@ -487,14 +504,14 @@ def get_last_run_info():
         }
     }
 
-def query_run_snippets(ollama_server, run_id, query_text, vector_db_path="files_index", top_k=3):
-    embeddings = OllamaEmbeddings(
-        model="nomic-embed-text",
-        base_url=f"{ollama_server}"
-    )
-    db = FAISS.load_local(vector_db_path, embeddings, allow_dangerous_deserialization=True)
-    results = db.similarity_search(query_text, k=top_k)
-    return [r for r in results if r.metadata.get("run_id") == run_id]
+# def query_run_snippets(ollama_server, run_id, query_text, vector_db_path="files_index", top_k=3):
+#     embeddings = OllamaEmbeddings(
+#         model="nomic-embed-text",
+#         base_url=f"{ollama_server}"
+#     )
+#     db = FAISS.load_local(vector_db_path, embeddings, allow_dangerous_deserialization=True)
+#     results = db.similarity_search(query_text, k=top_k)
+#     return [r for r in results if r.metadata.get("run_id") == run_id]
 
 def query_last_run_snippets(ollama_server, query_text, vector_db_path="files_index", top_k=3, doc_type=None):
     info = get_last_run_info()
@@ -540,6 +557,68 @@ Provide specific MQ5 code changes or refactoring ideas.
     response = ollama_model.invoke(prompt)
 
     return response
+
+def generate_patch_from_git(code_repo, old_code_file, user_commit_message, new_code):
+    """
+    Overwrite the file with new code, stage changes, commit, generate a patch file,
+    then reset back to baseline. Returns the full path to the generated patch file.
+    """
+
+    try:
+        # --- Ensure repo is initialized ---
+        if not os.path.exists(os.path.join(code_repo, ".git")):
+            subprocess.run(["git", "init"], cwd=code_repo, check=True)
+            gitignore_path = os.path.join(code_repo, ".gitignore")
+            if not os.path.exists(gitignore_path):
+                with open(gitignore_path, "w", encoding="utf-8") as gi:
+                    gi.write("*.patch\n")
+                    gi.write("patches\n")
+            subprocess.run(["git", "add", "."], cwd=code_repo, check=True)
+            subprocess.run(["git", "commit", "-m", "init with files"], cwd=code_repo, check=True)
+
+        # --- Overwrite file with regenerated code ---
+        with open(old_code_file, "w", encoding="utf-8") as f:
+            f.write(new_code)
+
+        # --- Stage the file (relative path from repo root) ---
+        rel_path = os.path.relpath(old_code_file, code_repo)
+        subprocess.run(["git", "add", rel_path], cwd=code_repo, check=True)
+
+        # --- Check if there are staged changes ---
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=code_repo,
+            capture_output=True,
+            text=True
+        )
+        if not status.stdout.strip():
+            raise RuntimeError("No changes to commit. Did you overwrite the file with new content?")
+
+        # --- Commit ---
+        subprocess.run(["git", "commit", "-m", user_commit_message], cwd=code_repo, check=True)
+
+        # --- Generate patch file ---
+        patch_dir = os.path.join(code_repo, "patches")
+        os.makedirs(patch_dir, exist_ok=True)
+
+        result = subprocess.run(
+            ["git", "format-patch", "-1", "HEAD", "-o", "patches"],
+            cwd=code_repo,
+            check=True,
+            capture_output=True,
+            text=True
+        )
+        patch_filename = result.stdout.strip()
+        patch_path = os.path.join(patch_dir, patch_filename)
+
+        # --- Reset back to baseline ---
+        subprocess.run(["git", "reset", "--hard", "HEAD~1"], cwd=code_repo, check=True)
+
+        return patch_path
+
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"Git error while generating patch: {e}") from e
+
 
 def apply_improvements_to_git(repo_dir, ea_file_path, header_file_path, improvements_text,
                               run_id=None,
@@ -664,100 +743,100 @@ print("start operation =========================================================
 
 # copyfiles(EA_MQ5_SUBPATH, EA_HEADER_SUBPATH, AGENT_PATH)
 
-result = compile_ea(EA_MQL_FILE, METAEDITOR)
+# result = compile_ea(EA_MQL_FILE, METAEDITOR)
 
-#  generate ini
-ini_file = update_ini_file(
-    ini_path="tester.ini",
-    login=os.getenv("MT5_LOGIN"),
-    password=os.getenv("MT5_PASSWORD"),
-    server=os.getenv("MT5_SERVER"),
-    expert=EA_EX_NAME,
-    symbol="XAUUSD",
-    period="M5",
-    from_date="2025.04.01",
-    to_date="2025.04.05",
-    report_path=r"Tester_report.html",
-    updates={
-        "Expert": EA_EX_NAME,
-        "Symbol": "XAUUSD",
-        "Period": "M5",
-        "FromDate": "2025.05.01",
-        "ToDate": "2025.05.10",
-        "Visual" : False,
-        "Report" : "Tester_report.html",
-    }
-)
+# #  generate ini
+# ini_file = update_ini_file(
+#     ini_path="tester.ini",
+#     login=os.getenv("MT5_LOGIN"),
+#     password=os.getenv("MT5_PASSWORD"),
+#     server=os.getenv("MT5_SERVER"),
+#     expert=EA_EX_NAME,
+#     symbol="XAUUSD",
+#     period="M5",
+#     from_date="2025.04.01",
+#     to_date="2025.04.05",
+#     report_path=r"Tester_report.html",
+#     updates={
+#         "Expert": EA_EX_NAME,
+#         "Symbol": "XAUUSD",
+#         "Period": "M5",
+#         "FromDate": "2025.05.01",
+#         "ToDate": "2025.05.10",
+#         "Visual" : False,
+#         "Report" : "Tester_report.html",
+#     }
+# )
 
-# perform backtest
-run_id, archive_folder, report_file, log_file = run_mt5_backtest(
-    ini_file,
-    TERMINAL_PATH,
-    BACKTEST_REPORT_PATH,
-    BACKTEST_LOG_PATH,
-    "logs",
-    False,
-    30,
-)
-print("run_id:", run_id)
-print("archive_folder:", archive_folder)
-print("report_file:", report_file)
-print("log_file:", log_file)
+# # perform backtest
+# run_id, archive_folder, report_file, log_file = run_mt5_backtest(
+#     ini_file,
+#     TERMINAL_PATH,
+#     BACKTEST_REPORT_PATH,
+#     BACKTEST_LOG_PATH,
+#     "logs",
+#     False,
+#     30,
+# )
+# print("run_id:", run_id)
+# print("archive_folder:", archive_folder)
+# print("report_file:", report_file)
+# print("log_file:", log_file)
 
-json_report_file = report_tables_to_json(
-    report_file, 
-    archive_folder=archive_folder,
-    output_json="report_tables.json",
-)
+# json_report_file = report_tables_to_json(
+#     report_file, 
+#     archive_folder=archive_folder,
+#     output_json="report_tables.json",
+# )
 
-# generate vector id once stored to vector store
-vector_ids = process_run_for_embeddings(
-    ollama_server=OLLAMA_SERVER,
-    run_id=run_id,
-    archive_folder=archive_folder,
-    ea_source_file=EA_MQL_FILE,
-    log_file=log_file,
-    report_file=report_file,
-    header_files=[
-        HEADER_MQL_FILE,
-    ]
-)
+# # generate vector id once stored to vector store
+# vector_ids = process_run_for_embeddings(
+#     ollama_server=OLLAMA_SERVER,
+#     run_id=run_id,
+#     archive_folder=archive_folder,
+#     ea_source_file=EA_MQL_FILE,
+#     log_file=log_file,
+#     report_file=report_file,
+#     header_files=[
+#         HEADER_MQL_FILE,
+#     ]
+# )
 
-# merge metadata and memory json together
-metadata_path = save_run_and_update_memory(
-    run_id=run_id,
-    ea_name=EA_NAME,
-    parameters=load_params_from_ini(ini_file),
-    archive_folder=archive_folder,
-    report_files=[os.path.basename(report_file)],
-    log_file=os.path.basename(log_file),
-    compiled_file=EA_EX_NAME,
-    vector_ids=vector_ids,
-    summary=parse_backtest_report(json_report_file),
-)
+# # merge metadata and memory json together
+# metadata_path = save_run_and_update_memory(
+#     run_id=run_id,
+#     ea_name=EA_NAME,
+#     parameters=load_params_from_ini(ini_file),
+#     archive_folder=archive_folder,
+#     report_files=[os.path.basename(report_file)],
+#     log_file=os.path.basename(log_file),
+#     compiled_file=EA_EX_NAME,
+#     vector_ids=vector_ids,
+#     summary=parse_backtest_report(json_report_file),
+# )
 
-code_suggest = "trailing stop logic with drawdown > 5%"
-improvements = suggest_code_improvements(OLLAMA_SERVER, code_suggest)
-print("Suggested Improvements:\n", improvements)
+# code_suggest = "trailing stop logic with drawdown > 5%"
+# improvements = suggest_code_improvements(OLLAMA_SERVER, code_suggest)
+# # print("Suggested Improvements:\n", improvements)
 
-# Apply improvements and commit, returns the full commit message string
-full_commit_message = apply_improvements_to_git(
-    repo_dir="MQL5",
-    ea_file_path=EA_MQ5_SUBPATH,
-    header_file_path=EA_HEADER_SUBPATH,
-    improvements_text=improvements,
-    run_id=run_id,
-    commit_message=code_suggest,
-    mt5_mql5_folder=AGENT_PATH
-)
+# # Apply improvements and commit, returns the full commit message string
+# full_commit_message = apply_improvements_to_git(
+#     repo_dir="MQL5",
+#     ea_file_path=EA_MQ5_SUBPATH,
+#     header_file_path=EA_HEADER_SUBPATH,
+#     improvements_text=improvements,
+#     run_id=run_id,
+#     commit_message=code_suggest,
+#     mt5_mql5_folder=AGENT_PATH
+# )
 
-# Get the commit hash of the commit just made
-commit_hash = subprocess.check_output(
-    ["git", "rev-parse", "HEAD"], cwd="MQL5"
-).decode().strip()
+# # Get the commit hash of the commit just made
+# commit_hash = subprocess.check_output(
+#     ["git", "rev-parse", "HEAD"], cwd="MQL5"
+# ).decode().strip()
 
-# Record commit info into metadata.json and memory.json
-record_git_commit_to_metadata_and_memory(run_id, commit_hash, "MQL5", archive_folder)
+# # Record commit info into metadata.json and memory.json
+# record_git_commit_to_metadata_and_memory(run_id, commit_hash, "MQL5", archive_folder)
 
 
 
