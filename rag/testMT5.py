@@ -15,6 +15,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_ollama import OllamaEmbeddings, OllamaLLM
 import codecs
+import time
 
 class JSONMemory:
     def __init__(self, path="memory.json"):
@@ -300,50 +301,144 @@ def extract_number(val_str):
         return float(match.group(0))
     return None
 
-def parse_backtest_report(report_file_json):
-    if not os.path.exists(report_file_json):
-        raise FileNotFoundError(f"Report JSON not found: {report_file_json}")
+def beautify_report(data):
+    """
+    Beautify trading report JSON:
+    - table_0: split into settings, inputs, results
+    - table_1: restructure into table_orders and table_deals
+    """
 
-    with open(report_file_json, "r", encoding="utf-8") as f:
-        tables = json.load(f)
+    def normalize_row(d):
+        cleaned = {k: v for k, v in d.items() if v and str(v).lower() != "nan"}
+        values = list(cleaned.values())
+        if not values:
+            return None
+        unique_values = list(dict.fromkeys(values))
+        if len(unique_values) == 1:
+            return {"value": unique_values[0]}
+        else:
+            return {"label": unique_values[0], "value": unique_values[1]}
 
-    summary = {}
+    def split_table0(lst):
+        settings, inputs, results = [], [], []
+        mode = "settings"
+        for item in lst:
+            if isinstance(item, dict):
+                item = normalize_row(item)
+            if not item:
+                continue
 
-    for tname, rows in tables.items():
-        for row in rows:
-            keys = sorted(row.keys(), key=lambda x: int(x))
-            for i in range(0, len(keys)-1, 2):
-                label = str(row[keys[i]]).strip() if row[keys[i]] and str(row[keys[i]]).lower() != "nan" else None
-                val   = str(row[keys[i+1]]).strip() if row[keys[i+1]] and str(row[keys[i+1]]).lower() != "nan" else None
-                if not label or not val:
+            if mode == "settings":
+                if item.get("label") == "Inputs:":
+                    mode = "inputs"
+                    inputs.append(item)
+                    continue
+                elif item.get("value") == "Results":
+                    mode = "results"
+                    continue
+                settings.append(item)
+            elif mode == "inputs":
+                if item.get("value") == "Results":
+                    mode = "results"
+                    continue
+                inputs.append(item)
+            else:
+                results.append(item)
+
+        return settings, inputs, results
+
+    def normalize_table1(table1):
+        orders, deals = [], []
+        order_headers, deal_headers = [], []
+        mode = None
+
+        for row in table1:
+            if isinstance(row, dict):
+                values = list(row.values())
+
+                if "Orders" in values:
+                    mode = "orders"
+                    continue
+                elif "Deals" in values:
+                    mode = "deals"
                     continue
 
-                num = extract_number(val)  # safely extract numeric part
+                if mode == "orders" and not order_headers:
+                    order_headers = values
+                    continue
+                if mode == "deals" and not deal_headers:
+                    deal_headers = values
+                    continue
 
-                if label.startswith("Total Net Profit") and num is not None:
-                    summary["net_profit"] = num
-                elif label.startswith("Gross Profit") and num is not None:
-                    summary["gross_profit"] = num
-                elif label.startswith("Gross Loss") and num is not None:
-                    summary["gross_loss"] = num
-                elif label.startswith("Profit Factor") and num is not None:
-                    summary["profit_factor"] = num
-                elif label.startswith("Expected Payoff") and num is not None:
-                    summary["expected_payoff"] = num
-                elif label.startswith("Sharpe Ratio") and num is not None:
-                    summary["sharpe_ratio"] = num
-                elif label.startswith("Total Trades") and num is not None:
-                    summary["trades"] = int(num)
-                elif label.startswith("Short Trades"):
-                    summary["short_trades"] = val
-                elif label.startswith("Long Trades"):
-                    summary["long_trades"] = val
-                elif label.startswith("Profit Trades"):
-                    summary["profit_trades"] = val
-                elif label.startswith("Loss Trades"):
-                    summary["loss_trades"] = val
+                if all(v is None or str(v).lower() == "nan" for v in values):
+                    continue
 
-    return summary
+                if mode == "orders" and order_headers:
+                    row_dict = {order_headers[i]: values[i] if i < len(values) else None
+                                for i in range(len(order_headers))}
+                    orders.append(row_dict)
+                elif mode == "deals" and deal_headers:
+                    row_dict = {deal_headers[i]: values[i] if i < len(values) else None
+                                for i in range(len(deal_headers))}
+                    deals.append(row_dict)
+
+        return orders, deals
+
+    # Apply transformations
+    if "table_0" in data:
+        settings, inputs, results = split_table0(data["table_0"])
+        data["table_0"] = settings
+        if inputs:
+            data["table_inputs"] = inputs
+        if results:
+            data["table_results"] = results
+    if "table_1" in data:
+        orders, deals = normalize_table1(data["table_1"])
+        data["table_orders"] = orders
+        data["table_deals"] = deals
+        del data["table_1"]
+
+    return data
+
+def extract_tester_report_summary(json_file):
+    """
+    Load a tester report JSON, clean it with beautify_report,
+    save the cleaned version, remove unnecessary tables,
+    and delete the original file.
+
+    Args:
+        json_file (str or Path): Path to the raw tester report JSON.
+
+    Returns:
+        tuple: (cleaned_data dict, Path to cleaned JSON file)
+    """
+    json_file = Path(json_file)
+
+    # Load raw JSON
+    with json_file.open("r", encoding="utf-8") as f:
+        raw_data = json.load(f)
+
+    # Apply cleaning
+    cleaned_data = beautify_report(raw_data)
+
+    # Save cleaned report
+    report_tables_clean_file = json_file.parent / "report_tables_clean.json"
+    with report_tables_clean_file.open("w", encoding="utf-8") as f:
+        json.dump(cleaned_data, f, indent=4, ensure_ascii=False)
+    print(f"Cleaned report saved to: {report_tables_clean_file}")
+
+    # Remove unnecessary tables if present
+    for key in ("table_0", "table_inputs"):
+        if key in cleaned_data:
+            del cleaned_data[key]
+
+    # Delete original file safely
+    if json_file.exists():
+        json_file.unlink()
+        print(f"Original file removed: {json_file}")
+
+    return cleaned_data, report_tables_clean_file
+
 
 def load_params_from_ini(ini_file):
     """
@@ -357,7 +452,7 @@ def load_params_from_ini(ini_file):
     return params
 
 def save_run_metadata(run_id, ea_name, parameters, archive_folder,
-                      report_files, log_file, compiled_file, vector_ids, summary):
+                      report_files, log_file, vector_ids, summary):
     """
     Save run metadata into metadata.json inside archive folder.
     Parameters are loaded from ini file.
@@ -369,7 +464,6 @@ def save_run_metadata(run_id, ea_name, parameters, archive_folder,
         "archive_folder": archive_folder,
         "report_files": report_files,
         "log_file": log_file,
-        "compiled_file": compiled_file,
         "vector_ids": vector_ids,
         "summary": summary            # dict from parse_backtest_report
     }
@@ -380,25 +474,21 @@ def save_run_metadata(run_id, ea_name, parameters, archive_folder,
 
     print(f"Saved metadata.json for run {run_id}")
 
-def save_run_and_update_memory(run_id, ea_name, parameters, archive_folder,
-                               report_files, log_file, compiled_file,
-                               vector_ids, summary):
+def save_run_and_update_memory(run_id, parameters, archive_folder,
+                               report_files, log_file, vector_ids):
     """
     Save run metadata into metadata.json and update memory.json with latest run info.
     """
     metadata = {
         "run_id": run_id,
         "timestamp": datetime.now().isoformat(),
-        "ea_name": ea_name,
         "parameters": parameters,
         "artifacts": {
             "archive_folder": archive_folder,
-            "compiled_file": compiled_file,
             "report_variants": report_files,
             "log_file": log_file,
         },
         "vector_db": vector_ids,
-        "summary": summary,
     }
 
     # Save metadata.json inside archive folder
@@ -409,10 +499,9 @@ def save_run_and_update_memory(run_id, ea_name, parameters, archive_folder,
     # Update memory.json
     ltm = JSONMemory(path="memory.json")
     ltm.store("LAST_RUN_ID", run_id)
-    ltm.store("LAST_RUN_EA", ea_name)
     ltm.store("LAST_RUN_ARCHIVE", archive_folder)
     ltm.store("LAST_RUN_CODE_EMBEDDING_ID", vector_ids.get("code_embedding_id"))
-    ltm.store("LAST_HEADER_EMBEDDING_IDS", vector_ids.get("header_embedding_ids"))
+    ltm.store("LAST_RUN_HEADER_EMBEDDING_ID", vector_ids.get("header_embedding_id"))
     ltm.store("LAST_RUN_LOG_EMBEDDING_ID", vector_ids.get("log_embedding_id"))
     ltm.store("LAST_RUN_REPORT_EMBEDDING_ID", vector_ids.get("report_embedding_id"))
 
@@ -423,68 +512,94 @@ def save_run_and_update_memory(run_id, ea_name, parameters, archive_folder,
 
     print(f"Saved run {run_id} and updated memory.json")
 
-def embed_and_store(ollama_server, file_path, vector_db_path, doc_type, run_id):
+def embed_and_store(ollama_server, file_path, vector_db_path, doc_type, run_id,
+                    chunk_size=2000, chunk_overlap=50):
     with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
         text = f.read()
 
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
     docs = splitter.create_documents([text])
 
-    for d in docs:
-        d.metadata = {"run_id": run_id, "doc_type": doc_type}
+    for i, d in enumerate(docs):
+        d.metadata = {"run_id": run_id, "doc_type": doc_type, "chunk_index": i}
 
     embeddings = OllamaEmbeddings(
-        model="nomic-embed-text",
+        model=os.getenv("EMBEDDED_AGENT"),
         base_url=f"{ollama_server}"
     )
 
-    # Ensure vector_db_path exists
     os.makedirs(vector_db_path, exist_ok=True)
-
     index_file = os.path.join(vector_db_path, "index.faiss")
+
     if os.path.exists(index_file):
-        # Load existing FAISS index safely
         db = FAISS.load_local(vector_db_path, embeddings, allow_dangerous_deserialization=True)
         db.add_documents(docs)
     else:
-        # Create new FAISS index from docs
         db = FAISS.from_documents(docs, embeddings)
 
     db.save_local(vector_db_path)
-
     return f"{doc_type}_{run_id}"
 
-def process_run_for_embeddings(ollama_server, run_id, archive_folder, ea_source_file, log_file, report_file, header_files=None):
+def process_run_for_embeddings(
+    ollama_server, run_id,
+    ea_source_file, log_file, report_file,
+    header_files=None,
+    log_chunk_size=10000   # number of lines per chunk
+):
     vector_db_path = "files_index"
 
-    print("storing ea_source_file =", ea_source_file, "...")
-    code_id = embed_and_store(ollama_server, ea_source_file, vector_db_path, "code", run_id)
+    def store_with_stats(file_path, doc_type):
+        if file_path and os.path.exists(file_path):
+            size_mb = os.path.getsize(file_path) / (1024 * 1024)
+            print(f"storing {doc_type} = {file_path} (size: {size_mb:.2f} MB)...")
+            start = time.perf_counter()
+            embedding_id = embed_and_store(ollama_server, file_path, vector_db_path, doc_type, run_id)
+            elapsed = time.perf_counter() - start
+            print(f"{doc_type} stored in {elapsed:.2f} seconds")
+            return embedding_id
+        else:
+            print(f"{doc_type} file not found, skipping...")
+            return None
 
-    header_ids = []
-    if header_files:
-        for hf in header_files:
-            print("storing header =", hf, "...")
-            hid = embed_and_store(ollama_server, hf, vector_db_path, "header", run_id)
-            header_ids.append(hid)
+    # EA source file
+    code_id = store_with_stats(ea_source_file, "code")
 
+    # Header file(s) – if you want multiple headers, loop here
+    header_id = store_with_stats(header_files, "header")
+
+    # Log file with chunking
     log_id = None
     if log_file and os.path.exists(log_file):
-        print("storing log_file =", log_file, "...")
-        log_id = embed_and_store(ollama_server, log_file, vector_db_path, "log", run_id)
+        size_mb = os.path.getsize(log_file) / (1024 * 1024)
+        print(f"storing log_file = {log_file} (size: {size_mb:.2f} MB)...")
+        with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+
+        chunk_ids = []
+        for i in range(0, len(lines), log_chunk_size):
+            chunk_lines = lines[i:i+log_chunk_size]
+            chunk_file = f"{log_file}_part_{i//log_chunk_size}.txt"
+            with open(chunk_file, "w", encoding="utf-8") as out:
+                out.writelines(chunk_lines)
+
+            start = time.perf_counter()
+            chunk_id = embed_and_store(ollama_server, chunk_file, vector_db_path, "log", run_id)
+            elapsed = time.perf_counter() - start
+            print(f"log chunk {i//log_chunk_size} stored in {elapsed:.2f} seconds")
+            chunk_ids.append(chunk_id)
+
+        # unify into a single identifier
+        log_id = f"log_{run_id}"
     else:
         print("log_file not found, skipping...")
 
-    report_id = None
-    if report_file and os.path.exists(report_file):
-        print("storing report_file =", report_file, "...")
-        report_id = embed_and_store(ollama_server, report_file, vector_db_path, "report", run_id)
-    else:
-        print("report_file not found, skipping...")
+    # Report file
+    report_id = store_with_stats(report_file, "report")
 
     print("done storing to vector at", vector_db_path)
     return {
         "code_embedding_id": code_id,
-        "header_embedding_ids": header_ids,
+        "header_embedding_id": header_id,
         "log_embedding_id": log_id,
         "report_embedding_id": report_id
     }
@@ -494,40 +609,89 @@ def get_last_run_info():
     ltm = JSONMemory(path="memory.json")
     return {
         "run_id": ltm.get("LAST_RUN_ID"),
-        "archive_folder": ltm.get("LAST_RUN_ARCHIVE"),
-        "ea_name": ltm.get("LAST_RUN_EA"),
         "vector_db": {
             "code_embedding_id": ltm.get("LAST_RUN_CODE_EMBEDDING_ID"),
             "log_embedding_id": ltm.get("LAST_RUN_LOG_EMBEDDING_ID"),
             "report_embedding_id": ltm.get("LAST_RUN_REPORT_EMBEDDING_ID"),
-            "header_embedding_ids": ltm.get("LAST_RUN_HEADER_EMBEDDING_IDS")
+            "header_embedding_id": ltm.get("LAST_RUN_HEADER_EMBEDDING_ID")  # singular for consistency
         }
     }
 
-# def query_run_snippets(ollama_server, run_id, query_text, vector_db_path="files_index", top_k=3):
-#     embeddings = OllamaEmbeddings(
-#         model="nomic-embed-text",
-#         base_url=f"{ollama_server}"
-#     )
-#     db = FAISS.load_local(vector_db_path, embeddings, allow_dangerous_deserialization=True)
-#     results = db.similarity_search(query_text, k=top_k)
-#     return [r for r in results if r.metadata.get("run_id") == run_id]
-
-def query_last_run_snippets(ollama_server, query_text, vector_db_path="files_index", top_k=3, doc_type=None):
+def query_last_run_snippets(
+    ollama_server,
+    query_text=None,
+    vector_db_path="files_index",
+    top_k=10,
+    doc_type=None
+):
+    """Query FAISS index for snippets from the last run, optionally filtered by doc_type."""
     info = get_last_run_info()
     run_id = info["run_id"]
+    print("get_last_run_info:", info)
 
     embeddings = OllamaEmbeddings(
-        model="nomic-embed-text",
+        model=os.getenv("EMBEDDED_AGENT"),
         base_url=f"{ollama_server}"
     )
     db = FAISS.load_local(vector_db_path, embeddings, allow_dangerous_deserialization=True)
 
-    results = db.similarity_search(query_text, k=top_k)
-    filtered = [r for r in results if r.metadata.get("run_id") == run_id]
+    # If query_text provided, do similarity search
+    if query_text:
+        results = db.similarity_search(query_text, k=top_k)
+        filtered = [r for r in results if r.metadata.get("run_id") == run_id]
+    else:
+        print("No query_text so pull all docs")
+        # Directly pull all docs for this run
+        all_docs = list(db.docstore._dict.values())
+        filtered = [r for r in all_docs if r.metadata.get("run_id") == run_id]
+
+        # Limit results if top_k specified
+        if top_k and len(filtered) > top_k:
+            filtered = filtered[:top_k]
+
+    # Optional filter by doc_type
     if doc_type:
         filtered = [r for r in filtered if r.metadata.get("doc_type") == doc_type]
+
     return filtered
+
+def analyze_and_improve(ollama_server, query_text=None):
+
+    start = time.perf_counter()
+    print("start analyze_and_improve")
+    snippets = query_last_run_snippets(ollama_server, query_text)
+    elapsed = time.perf_counter() - start
+    # print("last_run_snippets:",snippets , " with {elapsed:.2f} seconds")
+
+    reasoning_prompt = f"""
+    You are an expert MQL5 developer and quantitative trader.
+    Analyze the loss deals, resolve with EA improvements, retest, and check differences.
+
+    Tasks:
+    1) Identify all loss deals in report_tables_clean table_deals from context.
+    2) For each loss deal, match the deal time with context log entries and extract the reason.
+    3) Inspect the EA function Trade_Strategy. Advise how to resolve the issue.
+    4) Propose specific MQL5 code changes or refactors in Trade_Strategy (show code snippets).
+    5) Compare the new backtest results. Verify if the previously losing deals are now resolved.
+
+    Context:
+    { "\n\n".join([s.page_content for s in snippets]) }
+    """
+    print("perform reasoning_prompt for analysis.")
+    start = time.perf_counter()
+    reasoning_model = OllamaLLM(model=os.getenv("REASONING_AGENT"), base_url=ollama_server)
+    analysis = reasoning_model.invoke(reasoning_prompt)
+    elapsed = time.perf_counter() - start
+    print("analysis:", analysis, " with {elapsed:.2f} seconds")
+
+    coder_prompt = f"Based on this analysis:\n{analysis}\nShow MQL5 code changes in Trade_Strategy."
+    print("coder_prompt:", coder_prompt)
+    start = time.perf_counter()
+    coder_model = OllamaLLM(model=os.getenv("CODER_AGENT"), base_url=ollama_server)
+    code_fix = coder_model.invoke(coder_prompt)
+    elapsed = time.perf_counter() - start
+    print("code_fix:", code_fix, " with {elapsed:.2f} seconds")
+    return {"reasoning_prompt": reasoning_prompt, "analysis": analysis, "code_fix": code_fix}
 
 
 def suggest_code_improvements(ollama_server, query_text):
@@ -543,7 +707,7 @@ def suggest_code_improvements(ollama_server, query_text):
     # Step 3: Send to model for improvement suggestions
     prompt = f"""
 You are an expert MQL5 developer. Analyze the following snippets (code, headers, logs, reports)
-and suggest improvements to the EA source code.
+and suggest improvements to the EA source code. Specially trading strategy. 
 
 Query: {query_text}
 
@@ -553,7 +717,10 @@ Context:
 Provide specific MQ5 code changes or refactoring ideas.
     """
 
-    ollama_model = OllamaLLM(model="mistral:7b", base_url=OLLAMA_SERVER)
+    ollama_model = OllamaLLM(
+        model=os.getenv("CODER_AGENT"),
+        base_url=OLLAMA_SERVER
+    )
     response = ollama_model.invoke(prompt)
 
     return response
@@ -684,6 +851,37 @@ def apply_improvements_to_git(repo_dir, ea_file_path, header_file_path, improvem
     # Return the commit message string
     return full_commit_message
 
+def clean_log(input_file: str, archive_folder: str = "archive") -> str:
+    """
+    Remove the first 4 whitespace-separated columns from each line
+    in the log file and write to a new file inside the archive folder.
+    Returns the path of the cleaned output file.
+    """
+    # Ensure archive folder exists
+    os.makedirs(archive_folder, exist_ok=True)
+
+    # Build output filename inside archive folder
+    base_name = os.path.basename(input_file)
+    name, ext = os.path.splitext(base_name)
+    output_file = os.path.join(archive_folder, f"{name}_clean{ext}")
+
+    # Try common encodings until one works
+    for enc in ("utf-8", "utf-16", "latin-1"):
+        try:
+            with open(input_file, "r", encoding=enc) as infile, open(output_file, "w", encoding="utf-8") as outfile:
+                for line in infile:
+                    parts = line.strip().split()
+                    if not parts:
+                        continue
+                    cleaned = " ".join(parts[4:])
+                    outfile.write(cleaned + "\n")
+            print(f"Cleaned log written to {output_file} (read as {enc})")
+            return output_file
+        except UnicodeDecodeError:
+            continue
+
+    raise ValueError("Failed to decode file with common encodings.")
+
 def record_git_commit_to_metadata_and_memory(run_id, commit_hash, repo_dir, archive_folder):
     """
     Record the latest Git commit hash into metadata.json and memory.json.
@@ -788,6 +986,8 @@ print("start operation =========================================================
 #     archive_folder=archive_folder,
 #     output_json="report_tables.json",
 # )
+
+# extract_Tester_report_summary(json_report_file)
 
 # # generate vector id once stored to vector store
 # vector_ids = process_run_for_embeddings(

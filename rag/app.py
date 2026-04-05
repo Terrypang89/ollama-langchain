@@ -4,7 +4,10 @@ import difflib
 import os
 from dotenv import load_dotenv
 from langchain_ollama import OllamaLLM
-from testMT5 import update_ini_file, run_mt5_backtest, compile_ea, safe_read_file, report_tables_to_json, parse_backtest_report, process_run_for_embeddings, save_run_and_update_memory, generate_patch_from_git, query_last_run_snippets
+from testMT5 import update_ini_file, run_mt5_backtest, compile_ea, safe_read_file, \
+report_tables_to_json, process_run_for_embeddings, load_params_from_ini, \
+save_run_and_update_memory, generate_patch_from_git, query_last_run_snippets, \
+extract_tester_report_summary, analyze_and_improve, clean_log
 
 load_dotenv()
 OLLAMA_SERVER = os.getenv("OLLAMA_API_BASE")
@@ -47,9 +50,9 @@ def preview_improvements(old_code_file, code_repo, improvements, commit_message)
                     "Expert": EA_EX_NAME,
                     "Symbol": "XAUUSD",
                     "Period": "M5",
-                    "FromDate": "2025.05.01",
-                    "ToDate": "2025.05.10",
-                    "Visual": False,
+                    "FromDate": "2025.03.01",
+                    "ToDate": "2025.03.20",
+                    "Visual": True,
                     "Report": "Tester_report.html",
                 }
             )
@@ -68,7 +71,7 @@ def preview_improvements(old_code_file, code_repo, improvements, commit_message)
                 log_path=BACKTEST_LOG_PATH,
                 store_path="logs",
                 portable_enable=False,
-                timeout=30,
+                timeout=60,
             )
 
             # Convert report tables to JSON
@@ -78,8 +81,12 @@ def preview_improvements(old_code_file, code_repo, improvements, commit_message)
                 output_json="report_tables.json",
             )
 
+            # clean log file
+            clean_log_file = clean_log(log_file, archive_folder=archive_folder)
+
             # Parse summary from JSON
-            summary = parse_backtest_report(json_report_file)
+            # summary = parse_backtest_report(json_report_file)
+            summary,json_report_file = extract_tester_report_summary(json_report_file)
 
             # Display summary nicely
             st.subheader("Backtest Summary")
@@ -87,8 +94,8 @@ def preview_improvements(old_code_file, code_repo, improvements, commit_message)
 
             st.success(f"Backtest completed! Run ID: {run_id}")
             st.write(f"Archive folder: {archive_folder}")
-            st.write(f"Report file: {report_file}")
-            st.write(f"Log file: {log_file}")
+            st.write(f"Report file: {json_report_file}")
+            st.write(f"Log file: {clean_log_file}")
 
              # Use safe_read_file to avoid encoding errors
             # report_file = st.session_state.get("report_file")
@@ -96,22 +103,20 @@ def preview_improvements(old_code_file, code_repo, improvements, commit_message)
                 report_content = safe_read_file(report_file)
                 st.download_button("Download Report", report_content, file_name="Tester_report.html")
             # log_file = st.session_state.get("log_file")
-            if os.path.exists(log_file):
-                log_content = safe_read_file(log_file)
+            if os.path.exists(clean_log_file):
+                log_content = safe_read_file(clean_log_file)
                 st.download_button("Download Log", log_content, file_name="Tester_log.txt")
 
             # Store results in session state for later use
             st.session_state["run_id"] = run_id
             st.session_state["archive_folder"] = archive_folder
-            st.session_state["report_file"] = report_file
-            st.session_state["log_file"] = log_file
-            st.session_state["ini_file"] = ini_file
             st.session_state["json_report_file"] = json_report_file
+            st.session_state["clean_log_file"] = clean_log_file
+            st.session_state["ini_file"] = ini_file
             st.session_state["summary"] = summary
 
         except Exception as e:
             st.error(f"Backtest failed: {e}")
-
         
     # --- Separate button for storing to vector store ---
     st.subheader("Persist Run to Vector Store")
@@ -122,41 +127,39 @@ def preview_improvements(old_code_file, code_repo, improvements, commit_message)
             EA_HEADER_SUBPATH = os.getenv("EA_HEADER_SUBPATH")
             EA_MQL_FILE = os.path.join(AGENT_PATH, EA_MQ5_SUBPATH)
             HEADER_MQL_FILE = os.path.join(AGENT_PATH, EA_HEADER_SUBPATH)
+            EA_EX_NAME = os.getenv("EA_EX_NAME")
 
             run_id = st.session_state.get("run_id")
             archive_folder = st.session_state.get("archive_folder")
-            report_file = st.session_state.get("report_file")
-            log_file = st.session_state.get("log_file")
-            ini_file = st.session_state.get("ini_file")
             json_report_file = st.session_state.get("json_report_file")
-            summary = st.session_state.get("summary")
+            clean_log_file = st.session_state.get("clean_log_file")
+            ini_file = st.session_state.get("ini_file")
 
-            if not all([run_id, archive_folder, report_file, log_file, ini_file, summary]):
+            if not all([run_id, archive_folder, json_report_file, clean_log_file, ini_file]):
                 st.warning("Please run a backtest first before storing to vector store.")
             else:
+                st.write(f"Performing process_run_for_embeddings with run_id: {run_id} ...")
                 vector_ids = process_run_for_embeddings(
                     ollama_server=OLLAMA_SERVER,
                     run_id=run_id,
-                    archive_folder=archive_folder,
                     ea_source_file=EA_MQL_FILE,
-                    log_file=log_file,
-                    report_file=report_file,
-                    header_files=[HEADER_MQL_FILE],
+                    log_file=clean_log_file,
+                    report_file=json_report_file,
+                    header_files=HEADER_MQL_FILE,
                 )
+                st.success(f"Run stored to vector store! Vector IDs: {vector_ids}")
+                st.write(f"Performing save_run_and_update_memory ...")
 
                 metadata_path = save_run_and_update_memory(
                     run_id=run_id,
-                    ea_name=EA_NAME,
                     parameters=load_params_from_ini(ini_file),
                     archive_folder=archive_folder,
-                    report_files=[os.path.basename(report_file)],
-                    log_file=os.path.basename(log_file),
-                    compiled_file=EA_EX_NAME,
-                    vector_ids=vector_ids,
-                    summary=summary,
+                    report_files=[os.path.basename(json_report_file)],
+                    log_file=os.path.basename(clean_log_file),
+                    vector_ids=vector_ids
                 )
 
-                st.success(f"Run stored to vector store! Metadata saved at: {metadata_path}")
+                st.success(f"save_run_and_update_memory done! Metadata saved at: {metadata_path}")
                 st.write(f"Vector IDs: {vector_ids}")
         except Exception as e:
             st.error(f"Failed to store run to vector store: {e}")
@@ -169,8 +172,12 @@ def preview_improvements(old_code_file, code_repo, improvements, commit_message)
         old_code = f.read()
 
     # --- Improvements summary ---
-    st.subheader("Proposed Improvements Summary")
-    st.text_area("Improvements", improvements, height=200)
+    st.subheader("Analyze Improve Summary")
+    if st.button("Analyze && Improve "):
+        fix_data = analyze_and_improve(OLLAMA_SERVER)
+        st.write(f"reasoning_prompt: {fix_data["reasoning_prompt"]}")
+        st.write(f"analysis: {fix_data["analysis"]}")
+        st.write(f"code_fix: {fix_data["code_fix"]}")
 
     # --- Suggestions box ---
     st.subheader("Suggest Code Changes")
