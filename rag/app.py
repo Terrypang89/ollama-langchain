@@ -7,7 +7,7 @@ from langchain_ollama import OllamaLLM
 from testMT5 import update_ini_file, run_mt5_backtest, compile_ea, safe_read_file, \
 report_tables_to_json, process_run_for_embeddings, load_params_from_ini, \
 save_run_and_update_memory, generate_patch_from_git, query_last_run_snippets, \
-extract_tester_report_summary, analyze_and_improve, clean_log
+extract_tester_report_summary, analyze_and_improve, clean_log, suggest_code_improvements, beautify_text, store_analysis_snippets_json
 
 load_dotenv()
 OLLAMA_SERVER = os.getenv("OLLAMA_API_BASE")
@@ -164,111 +164,138 @@ def preview_improvements(old_code_file, code_repo, improvements, commit_message)
         except Exception as e:
             st.error(f"Failed to store run to vector store: {e}")
 
-    # --- Load old code from file ---
-    if not os.path.exists(old_code_file):
-        st.error(f"File not found: {old_code_file}")
-        return
-    with open(old_code_file, "r", encoding="utf-8") as f:
-        old_code = f.read()
-
     # --- Improvements summary ---
     st.subheader("Analyze Improve Summary")
-    if st.button("Analyze && Improve "):
-        fix_data = analyze_and_improve(OLLAMA_SERVER)
-        st.write(f"reasoning_prompt: {fix_data["reasoning_prompt"]}")
-        st.write(f"analysis: {fix_data["analysis"]}")
-        st.write(f"code_fix: {fix_data["code_fix"]}")
+    with st.form("edit_analyze_data_form"):
+        prompt_text = f"""You are an expert MQL5 developer and quantitative trader.
+            Analyze the loss deals, resolve with EA improvements, retest, and check differences.
 
-    # --- Suggestions box ---
-    st.subheader("Suggest Code Changes")
-    user_suggestions = st.text_area("Your Suggestions", "", height=200)
-
-    # --- Regenerate button ---
-    if st.button("Regenerate Code Changes"):
-        if user_suggestions.strip() or improvements.strip():
-#             prompt = f"""Here is the original code:\n{old_code}\n
-# Apply these improvements:\n{improvements}\n
-# And also consider these suggestions:\n{user_suggestions}\n
-# Please output the full updated code without commented:"""
-
-            # response = ollama_model.invoke(prompt)
-            # response = suggest_code_improvements(OLLAMA_SERVER, user_suggestions)
-            # code_suggest = "simplify my code"
-            snippets = query_last_run_snippets(OLLAMA_SERVER, user_suggestions)
-
-            print("snippets:", snippets)
-
-            # Step 2: Build context for the model
-            context = "\n\n".join([
-                f"[{s.metadata.get('doc_type','unknown')} snippet]\n{s.page_content}"
-                for s in snippets
-            ])
-
-            # Step 3: Send to model for improvement suggestions
-            prompt = f"""
-        You are an expert MQL5 developer. Analyze the following snippets (code, headers, logs, reports)
-        and suggest improvements to the EA source code. Specially trading strategy. 
-
-        Query: {user_suggestions}
-
-        Context:
-        {context}
-
-        Provide specific MQ5 code changes or refactoring ideas. Then output the full updated code.
+            Tasks:
+            1) Identify all loss deals in report_tables_clean table_deals from context.
+            2) For each loss deal, match the deal time with context log entries and extract the reason.
+            3) Inspect the EA function Trade_Strategy. Advise how to resolve the issue.
+            4) Propose specific MQL5 code changes or refactors in Trade_Strategy (show code snippets).
+            5) Compare the new backtest results. Verify if the previously losing deals are now resolved.
             """
+        prompt_suggestions = st.text_area("Prompt", prompt_text, height=300)
+        
+        # Checkbox to decide whether to fetch snippets
+        snippets_enable = st.checkbox("🔍 Include snippets")
+        analyze_submitted = st.form_submit_button("Analyze && Improve")
 
-            ollama_model = OllamaLLM(model="mistral:7b", base_url=OLLAMA_SERVER)
-            response = ollama_model.invoke(prompt)
+        if analyze_submitted:
+            fix_data = analyze_and_improve(OLLAMA_SERVER, prompt_suggestions, snippets_enable)
+            st.session_state["reasoning_prompt"] = fix_data["reasoning_prompt"]
+            st.session_state["analysis"] = fix_data["analysis"]
+            st.session_state["model_name"] = fix_data["model_name"]
+            st.session_state["run_id"] = fix_data["run_id"]
 
-            st.session_state["new_code"] = response
-            st.success("Code changes regenerated using Ollama!")
-        else:
-            st.warning("Please enter improvements or suggestions before regenerating.")
+    # Wrap editable fields + save button in a form
+    # with st.form("edit_fix_data_form"):
+        reasoning_prompt_edit = st.text_area(
+            "Reasoning Prompt (editable)",
+            st.session_state.get("reasoning_prompt"),
+            height=300
+        )
+        analysis_edit = st.text_area(
+            "Analysis (editable)",\
+            beautify_text(st.session_state.get("analysis")),
+            height=500
+        )
 
+        # Submit button for saving edits
+        save_edits = st.form_submit_button("💾 Save Edits")
+
+        if save_edits:
+            st.session_state["reasoning_prompt"] = reasoning_prompt_edit
+            st.session_state["analysis"] = analysis_edit
+            st.session_state["saved_flag"] = True
+            store_analysis_snippets_json(st.session_state.get("reasoning_prompt"), st.session_state.get("analysis"), st.session_state.get("model_name"))
+            print(f"saved reasoning_prompt and analysis to session_state and latest snippets_{st.session_state.get("run_id")}.json")
+
+    # ✅ Show success/info outside the form so it persists
+    if st.session_state.get("saved_flag"):
+        st.success(f"✅ Your edited analysis and reasoning prompt have been saved to snippets_{st.session_state.get("run_id")}.json")
+        st.info(f"Edits are saved in session state and snippets_{st.session_state.get("run_id")}.json")
+        print("Edits are saved in session state.")
+
+    # --- Regenerate code button ---
+    st.subheader("Regenerate Analyzed Code ")
+    with st.form("regenerate_form"):
+        coder_prompt_text = f""" Show MQL5 code changes for function Trade_Strategy."""
+        coder_prompt_suggestions = st.text_area("Prompt", coder_prompt_text, height=200)
+        
+        # Checkbox to decide whether to fetch snippets
+        fetch_snippets_enable = st.checkbox("🔍 Include latest snippets")
+        submitted = st.form_submit_button("Regenerate Code Changes")
+
+        if submitted:
+            st.session_state["coder_prompt_suggestions"] = coder_prompt_suggestions
+            analysis = st.session_state.get("analysis")
+            reasoning_prompt = st.session_state.get("reasoning_prompt")
+            code_response = suggest_code_improvements(
+                OLLAMA_SERVER, 
+                reasoning_prompt, 
+                analysis, 
+                coder_prompt_suggestions, 
+                fetch_snippets_enable
+            )
+            st.session_state["code_response"] = code_response  # store for later use
+        
     # --- Side-by-side preview ---
-    st.subheader("Side-by-Side Code Preview")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.code(old_code, language="python")
-    with col2:
-        st.code(st.session_state.get("new_code", old_code), language="python")
+    if "code_response" in st.session_state:
+        st.subheader("Analysis")
+        st.write(st.session_state["code_response"]["analysis_text"])
+        st.subheader("Side-by-Side Code Preview")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.code(st.session_state["code_response"]["old_code"], language="mql5")
+        with col2:
+            st.code(st.session_state["code_response"]["fix_code"], language="mql5")
+        
+        # Optional: show explanation text separately
+        if st.session_state["code_response"].get("explanation"):
+            st.markdown("**Explanation:**")
+            st.write(st.session_state["code_response"]["explanation"])
 
-    if "new_code" in st.session_state:
-        if st.button("Download Patch File"):
-            try:
-                patch_path = generate_patch_from_git(
-                    code_repo,
-                    old_code_file,
-                    user_commit_message,
-                    st.session_state["new_code"]
-                )
-                st.success(f"Patch file generated: {patch_path}")
-                st.session_state["latest_patch_path"] = patch_path
-                st.info("You can now apply it using the Apply button below.")
-            except RuntimeError as e:
-                st.error(str(e))
+        # --- Download Patch File preview ---
+        if "new_code" in st.session_state:
+            if st.button("Download Patch File"):
+                try:
+                    patch_path = generate_patch_from_git(
+                        code_repo,
+                        old_code_file,
+                        user_commit_message,
+                        st.session_state["new_code"]
+                    )
+                    st.success(f"Patch file generated: {patch_path}")
+                    st.session_state["latest_patch_path"] = patch_path
+                    st.info("You can now apply it using the Apply button below.")
+                except RuntimeError as e:
+                    st.error(str(e))
 
-    if st.button("Apply Approved Hunks to Git"):
-        patch_path = st.session_state.get("latest_patch_path")
-        if not patch_path or not os.path.exists(patch_path):
-            patch_dir = os.path.join(code_repo, "patches")
-            patch_files = [f for f in os.listdir(patch_dir) if f.endswith(".patch")]
-            if not patch_files:
-                st.error("No patch file found. Please generate one first.")
-                patch_path = None
-            else:
-                patch_files.sort()
-                latest_patch = patch_files[-1]
-                patch_path = os.path.join(patch_dir, latest_patch)
-                st.info(f"Using latest patch file: {patch_path}")
+    if "latest_patch_path" in st.session_state:
+        if st.button("Apply Approved Hunks to Git"):
+            patch_path = st.session_state.get("latest_patch_path")
+            if not patch_path or not os.path.exists(patch_path):
+                patch_dir = os.path.join(code_repo, "patches")
+                patch_files = [f for f in os.listdir(patch_dir) if f.endswith(".patch")]
+                if not patch_files:
+                    st.error("No patch file found. Please generate one first.")
+                    patch_path = None
+                else:
+                    patch_files.sort()
+                    latest_patch = patch_files[-1]
+                    patch_path = os.path.join(patch_dir, latest_patch)
+                    st.info(f"Using latest patch file: {patch_path}")
 
-        if patch_path and os.path.exists(patch_path):
-            try:
-                patch_relpath = os.path.relpath(patch_path, code_repo).replace("\\", "/")
-                subprocess.run(["git", "am", patch_relpath], cwd=code_repo, check=True)
-                st.success(f"Patch applied successfully from {patch_relpath}!")
-            except subprocess.CalledProcessError as e:
-                st.error(f"Git error while applying patch: {e}")
+            if patch_path and os.path.exists(patch_path):
+                try:
+                    patch_relpath = os.path.relpath(patch_path, code_repo).replace("\\", "/")
+                    subprocess.run(["git", "am", patch_relpath], cwd=code_repo, check=True)
+                    st.success(f"Patch applied successfully from {patch_relpath}!")
+                except subprocess.CalledProcessError as e:
+                    st.error(f"Git error while applying patch: {e}")
 
 
 if __name__ == "__main__":
