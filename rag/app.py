@@ -2,10 +2,11 @@ import streamlit as st
 import subprocess
 import difflib
 import os
+from datetime import datetime
 from dotenv import load_dotenv
 from langchain_ollama import OllamaLLM
 from cleanstore import clean_store, clean_snippets_json
-from testMT5 import update_ini_file, run_mt5_backtest, copyfiles, compile_ea, extract_errors, \
+from testMT5 import update_ini_file, run_mt5_backtest, copyfiles, compile_ea, extract_errors, count_tokens, \
 report_tables_to_json, load_params_from_ini, store_history_snippets_json, apply_patch_to_git, get_patch_content, process_run_for_embeddings, \
 save_run_and_update_memory, generate_patch_from_git, get_latest_snippet_json_data, beautify_text_area, find_patch_history, \
 extract_tester_report_summary, analyze_and_improve, clean_log, suggest_code_improvements, compile_fail_update_memory
@@ -348,7 +349,6 @@ explanation_code show the explanation of fix_code.
                 patch_files_list
             )
             st.session_state["coder_prompt"] = coder_prompt_suggestions
-            # st.session_state["code_response"] = code_response  # store for later use
             st.session_state["old_code"] = code_response["old_code"]
             st.session_state["fix_code"] = code_response["fix_code"]
             st.session_state["analysis_code"] = code_response["analysis_code"]
@@ -384,9 +384,19 @@ explanation_code show the explanation of fix_code.
             if st.session_state.get("old_code") and st.session_state.get("fix_code"):
                 col1, col2 = st.columns(2)
                 with col1:
-                    st.text_area("old_code", value=st.session_state["old_code"], height=1000)
+                    st.session_state["old_code"] = st.text_area(
+                        "old_code",
+                        value=st.session_state.get("old_code", ""),
+                        height=1000,
+                        key="old_code_area"
+                    )
                 with col2:
-                    st.text_area("fix_code", value=st.session_state["fix_code"], height=1000)
+                    st.session_state["fix_code"] = st.text_area(
+                        "fix_code",
+                        value=st.session_state.get("fix_code", ""),
+                        height=1000,
+                        key="fix_code_area"
+                    )
             
             # Optional: show explanation text separately
             if st.session_state.get("explanation_code"):
@@ -430,42 +440,60 @@ explanation_code show the explanation of fix_code.
                         )
 
                         st.success(f"Patch file generated: {patch_path}")
-
+                        # get the 
                         st.session_state["latest_patch_path"] = patch_path
                         st.session_state["latest_patch"] = get_patch_content(patch_path)
                         if st.session_state.get("latest_patch_path") and st.session_state.get("latest_patch"):
                             # check memory.json RUN_HISTORY run_id, check if their /logs/{run_id}/snippet_{run_id}.json
                             # if that particular snippet_{run_id}.json contain history previous_patch and latest_patch, put to current 
                             
-                            get_previous_patch, _, _, _ = get_latest_snippet_json_data("previous_patch", False)
+                            get_previous_patch_json, _, _, _ = get_latest_snippet_json_data("previous_patch", False)
                             get_latest_patch_json, archieve, run_id, run_id_num = get_latest_snippet_json_data("latest_patch", False)
                             
-                            if isinstance(get_latest_patch_json, dict) and "extras" in get_latest_patch_json:
-                                extras = get_latest_patch_json["extras"]
-                                new_prev_patch_run_id = extras.get("run_id", run_id)
-                                new_prev_patch_run_id_num = extras.get("run_id_num", run_id_num)
+                            if get_latest_patch_json and isinstance(get_latest_patch_json, dict):
+                                new_prev_patch_run_id = get_latest_patch_json.get("extras", {}).get("run_id", run_id)
+                                new_prev_patch_run_id_num = get_latest_patch_json.get("extras", {}).get("run_id_num", run_id_num)
+                                print(f"found extras in get_previous_patch_json")
 
-                                if get_previous_patch:
-                                    get_previous_patch[new_prev_patch_run_id] = {new_prev_patch_run_id_num: get_latest_patch_json}
-                                    store_history_snippets_json("previous_patch", get_previous_patch, False)
+                                # update previous_patch only if run_id/run_id_num differ
+                                if get_previous_patch_json:
+                                    print(f"prev get_latest_patch_json info {get_previous_patch_json["extras"]["run_id"]} and {get_latest_patch_json["extras"]["run_id_num"]}")
+                                    if (get_previous_patch_json["extras"]["run_id"] != run_id or
+                                        get_previous_patch_json["extras"]["run_id_num"] != run_id_num):
+                                        if run_id not in get_previous_patch_json:
+                                            get_previous_patch_json[run_id] = {}
+                                        get_previous_patch_json[new_prev_patch_run_id][new_prev_patch_run_id_num] = get_latest_patch_json
+                                        store_history_snippets_json("previous_patch", get_previous_patch_json, None, False)
+                                        print("Successful update latest_patch to previous_patch")
                                 else:
+                                    if (get_latest_patch_json["extras"]["run_id"] != run_id or
+                                        get_latest_patch_json["extras"]["run_id_num"] != run_id_num):
+                                        new_prev_patch = {
+                                            new_prev_patch_run_id: {
+                                                new_prev_patch_run_id_num: get_latest_patch_json
+                                            }
+                                        }
+                                        store_history_snippets_json("previous_patch", new_prev_patch, None, False)
+                                        print("Successful create previous_patch")
 
-                                    store_history_snippets_json("previous_patch", get_latest_patch_json, False)
-                                print("Successful update previous_patch")
-
-                            # store_history_snippets_json("latest_patch", st.session_state["latest_patch"], {"path": {st.session_state["latest_patch_path"]}, "run_id": run_id, "run_id_num": run_id_num})
-                            st.session_state["latest_patch"]["chunks"] = st.session_state["latest_patch"]
-                            st.session_state["latest_patch"]["path"] = st.session_state["latest_patch_path"]
-                            st.session_state["latest_patch"]["run_id"] = run_id
-                            st.session_state["latest_patch"]["run_id_num"] = run_id_num
-                            st.session_state["latest_patch"]["run_id_num"] = run_id_num
-                            st.session_state["latest_patch"]["token"] = count_tokens(st.session_state["latest_patch"], model_name, False)
+                            # ✅ Build latest_patch dict in the desired format
+                            patch_content = st.session_state["latest_patch"]
+                            st.session_state["latest_patch"] = {
+                                "chunks": [patch_content],  # wrap string in list
+                                "token": count_tokens(patch_content, os.getenv("CODER_AGENT"), False),
+                                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                "extras": {
+                                    "path": st.session_state["latest_patch_path"],
+                                    "run_id": run_id,
+                                    "run_id_num": run_id_num,
+                                }
+                            }
                             store_history_snippets_json(
                                 "latest_patch",
                                 st.session_state["latest_patch"],
                                 False
                             )
-                        st.info("You can now apply it using the Apply button below.")
+                            st.info("You can now apply it using the Apply button below.")
                     except RuntimeError as e:
                         st.error(str(e))
                 

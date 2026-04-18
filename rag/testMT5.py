@@ -713,6 +713,10 @@ def save_run_and_update_memory(run_id, parameters, archieve_folder,
 
     # --- Update memory.json ---
     ltm = JSONMemory(path="memory.json")
+    prev_run_id = ltm.get("LAST_RUN_ID")
+    prev_run_id_num = ltm.get("LAST_RUN_ID_NUM")
+    prev_archieve = ltm.get("LAST_RUN_ARCHIEVE")
+
     ltm.store("LAST_RUN_ID", run_id)
     ltm.store("LAST_RUN_ID_NUM", 0)
     ltm.store("LAST_RUN_ARCHIEVE", archieve_folder)
@@ -720,6 +724,12 @@ def save_run_and_update_memory(run_id, parameters, archieve_folder,
     ltm.store("LAST_RUN_HEADER_EMBEDDING_ID", vector_ids.get("header_embedding_id"))
     ltm.store("LAST_RUN_LOG_EMBEDDING_ID", vector_ids.get("log_embedding_id"))
     ltm.store("LAST_RUN_REPORT_EMBEDDING_ID", vector_ids.get("report_embedding_id"))
+    if prev_run_id and prev_run_id_num and prev_archieve:
+        if prev_run_id != run_id or prev_run_id_num != 0:
+            ltm.store("PREV_LAST_RUN_ID", prev_run_id)
+            ltm.store("PREV_LAST_RUN_ID_NUM", prev_run_id_num)
+            ltm.store("PREV_LAST_RUN_ARCHIEVE", prev_archieve)
+            print(f"updated PREV_LAST_RUN")
 
     # Insert newest run at the top of RUN_HISTORY list
     history = ltm.get("RUN_HISTORY") or []
@@ -735,6 +745,9 @@ def get_last_run_info():
         "run_id": ltm.get("LAST_RUN_ID"),
         'run_id_num': ltm.get("LAST_RUN_ID_NUM"),
         "archieve": ltm.get("LAST_RUN_ARCHIEVE"),
+        "rprev_un_id": ltm.get("PREV_LAST_RUN_ID"),
+        'prev_run_id_num': ltm.get("PREV_LAST_RUN_ID_NUM"),
+        "prev_archieve": ltm.get("PREV_LAST_RUN_ARCHIEVE"),
         "vector_db": {
             "code_embedding_id": ltm.get("LAST_RUN_CODE_EMBEDDING_ID"),
             "log_embedding_id": ltm.get("LAST_RUN_LOG_EMBEDDING_ID"),
@@ -1163,14 +1176,16 @@ def get_latest_snippet_json_data(snippet_state: str, need_content=True, json_run
 
     archive_dir = info.get("archive") or info.get("archieve")
     if not archive_dir:
+        print("❌ Archive directory not found in get_last_run_info() result")
         return {}, archive_dir, run_id, run_id_num
-        # raise KeyError("❌ Archive directory not found in get_last_run_info() result")
+        # return {"history": {}}, archive_dir, run_id, run_id_num
 
     archive_file = os.path.join(archive_dir, f"snippets_{run_id}.json")
 
     if not os.path.exists(archive_file):
         print(f"❌ Archive file {archive_file} not found.")
         return {}, archive_dir, run_id, run_id_num
+        # return {"history": {}}, archive_dir, run_id, run_id_num
 
     try:
         with open(archive_file, "r", encoding="utf-8") as f:
@@ -1182,11 +1197,13 @@ def get_latest_snippet_json_data(snippet_state: str, need_content=True, json_run
     history = json_snippets.get("history", {})
     if run_id not in history:
         print(f"❌ No entry for run_id {run_id} in {archive_file}.")
+        # return {}, archive_dir, run_id, run_id_num
         return {}, archive_dir, run_id, run_id_num
 
     latest_entry = history[run_id]
     if run_id_num not in latest_entry:
         print(f"❌ No entry for run_id_num {run_id_num} in {archive_file}.")
+        # return {}, archive_dir, run_id, run_id_num
         return {}, archive_dir, run_id, run_id_num
 
     section = latest_entry[run_id_num].get(snippet_state)
@@ -1205,6 +1222,7 @@ def get_latest_snippet_json_data(snippet_state: str, need_content=True, json_run
 
     print(f"❌ Failed to get snippet '{snippet_state}' from run_id {run_id}.")
     return {}, archive_dir, run_id, run_id_num
+    # return {"history": {}}, archive_dir, run_id, run_id_num
 
 def store_history_snippets_json(snippet_name, snippet_data, chunks_only=True, need_token=True, model_name=None):
     # need consider store from latest_patch to previous_patch
@@ -1243,7 +1261,8 @@ def store_history_snippets_json(snippet_name, snippet_data, chunks_only=True, ne
     if snippet_data and snippet_name and chunks_only:
         snippet_entry = {
             "chunks": snippet_data if isinstance(snippet_data, list) else [snippet_data],
-            "token": count_tokens(snippet_data, model_name, False) if need_token else None
+            "token": count_tokens(snippet_data, model_name, False) if need_token else None,
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
 
         # if extras:
@@ -1268,7 +1287,7 @@ def store_history_snippets_json(snippet_name, snippet_data, chunks_only=True, ne
     print(f"✅ Updated snippets archive at {archive_file}")
     return str(archive_file)
 
-def join_json_chunks(section: str = None) -> str:
+def join_json_chunks(section: str = None, previous_enable = False) -> str:
     """
     Load chunks from a JSON archive for the last run_id.
     If section is provided, return only that section's chunks.
@@ -1277,6 +1296,10 @@ def join_json_chunks(section: str = None) -> str:
     info = get_last_run_info()
     run_id = info["run_id"]
     run_id_num = info["run_id_num"]
+
+    # get the previous run_id and run_id_num
+    if previous_enable:
+        None
 
     archive_dir = info.get("archive") or info.get("archieve")
     if not archive_dir:
@@ -1378,6 +1401,9 @@ def analyze_and_improve(ollama_server, user_prompt, snippets_enable=False, json_
         mqh_header:
         {join_json_chunks("mqh_header")}
         """
+
+        # check if any latest_patch and 
+        # if 
 
     # Always run analysis
     reasoning_prompt_token = count_tokens(reasoning_prompt, model_name, False)
@@ -1680,19 +1706,34 @@ def generate_patch_from_git(code_repo, new_code, ea_file_path, header_file_path,
         # subprocess.run(["git", "add", str(file)], cwd=code_repo, check=True)
 
         # --- Commit changes ---
+        # --- Stage changes ---
     for file in changed_files:
         rel_path = os.path.relpath(file, code_repo)  # ensure relative path
         if not Path(file).is_file():
             raise RuntimeError(f"❌ File {file} not found or not modified, cannot add to git.")
         subprocess.run(["git", "add", rel_path], cwd=code_repo, check=True)
 
-
-    result = subprocess.run(
-        ["git", "commit", "-m", user_commit_message],
+    # --- Only commit if there are staged changes ---
+    status_result = subprocess.run(
+        ["git", "status", "--porcelain"],
         cwd=code_repo,
         capture_output=True,
         text=True
     )
+
+    if status_result.stdout.strip():  # non-empty means there are changes
+        result = subprocess.run(
+            ["git", "commit", "-m", user_commit_message],
+            cwd=code_repo,
+            capture_output=True,
+            text=True
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"Git commit failed: {result.stderr}")
+    else:
+        print("⚠️ No changes detected, skipping commit.")
+        return None
+
     if result.returncode != 0:
         raise RuntimeError(f"Git commit failed: {result.stderr}")
 
