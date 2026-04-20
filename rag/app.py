@@ -2,14 +2,17 @@ import streamlit as st
 import subprocess
 import difflib
 import os
+import json
+import websocket
 from datetime import datetime
 from dotenv import load_dotenv
 from langchain_ollama import OllamaLLM
+from langchain_community.chat_message_histories import StreamlitChatMessageHistory # stores message history
 from cleanstore import clean_store, clean_snippets_json
-from testMT5 import update_ini_file, run_mt5_backtest, copyfiles, compile_ea, extract_errors, count_tokens, \
+from testMT5 import update_ini_file, run_mt5_backtest, copyfiles, compile_ea, extract_errors, count_tokens, load_all_skills_name, \
 report_tables_to_json, load_params_from_ini, store_history_snippets_json, apply_patch_to_git, get_patch_content, process_run_for_embeddings, \
 save_run_and_update_memory, generate_patch_from_git, get_latest_snippet_json_data, beautify_text_area, find_patch_history, \
-extract_tester_report_summary, analyze_and_improve, clean_log, suggest_code_improvements, compile_fail_update_memory
+extract_tester_report_summary, analyze_and_improve, clean_log, suggest_code_improvements, compile_fail_update_memory, orchestrate_with_safe_invoke
 
 load_dotenv()
 OLLAMA_SERVER = os.getenv("OLLAMA_API_BASE")
@@ -242,17 +245,29 @@ def preview_improvements():
         prompt_suggestions = st.text_area("Prompt", prompt_text, height=300)
     
         # Checkbox to decide whether to fetch snippets
-        col1, col2, _ = st.columns([2, 2, 10], gap="xxsmall")
+        col1, col2, col3, _ = st.columns([2, 2, 2, 4], gap="xxsmall")
         with col1:
             snippets_enable = st.checkbox("🔍 Include FAISS snippets", value=False)
 
         with col2:
             json_chunk_enable = st.checkbox("🔍 Include JSON chunks", value=True)
+
+        with col3:
+            # load_all_skills()
+            skill_choice = st.selectbox(
+                "Choose Superpower skill",
+                load_all_skills_name(os.path.join(os.getenv("SUPERPOWER_DIR"), os.getenv("SUPERPOWER_SKILL_SUBPATH")))
+            )
         
         analyze_submitted = st.form_submit_button("Analyze && Improve")
 
         if analyze_submitted:
-            fix_data = analyze_and_improve(OLLAMA_SERVER, prompt_suggestions, snippets_enable, json_chunk_enable)
+            fix_data = analyze_and_improve(
+                OLLAMA_SERVER, 
+                prompt_suggestions, 
+                snippets_enable, 
+                json_chunk_enable
+            )
             st.session_state["prompt_suggestions"] = prompt_suggestions
             st.session_state["reasoning_prompt"] = fix_data["reasoning_prompt"]
             st.session_state["analysis"] = fix_data["analysis"]
@@ -509,6 +524,75 @@ explanation_code show the explanation of fix_code.
                     if full_commit_message:
                         store_history_snippets_json("patch_to_git", f"{full_commit_message} push={github_push_enable}")
                     st.success(f"Applied patch file {st.session_state["latest_patch_path"]} to git repo {os.getenv("EA_CODE_GIT_REPO")} with commit {full_commit_message}")
+
+    st.subheader("Superpowers Skill Runner")
+    history = StreamlitChatMessageHistory()
+
+    skills_dir = os.path.join(
+        os.getenv("SUPERPOWER_DIR"),
+        os.getenv("SUPERPOWER_SKILL_SUBPATH")
+    )
+
+    skill_choice = st.selectbox(
+        "Choose Superpower skill",
+        load_all_skills_name(skills_dir)
+    )
+
+    reasoning_data = st.checkbox("include reasoning data")
+
+    # Initialize flags
+    if "waiting_reply" not in st.session_state:
+        st.session_state.waiting_reply = False
+    if "reply_done" not in st.session_state:
+        st.session_state.reply_done = False
+
+    # Show full history
+    for msg in history.messages:
+        if msg.type == "human":
+            st.chat_message("user").markdown(msg.content)
+        elif msg.type == "ai":
+            st.chat_message("assistant").markdown(msg.content)
+
+    # Handle new input
+    if user_prompt := st.chat_input("Enter your request..."):
+        history.add_user_message(user_prompt)
+        
+        st.session_state.waiting_reply = True
+        st.session_state.reply_done = False
+        st.chat_message("user").markdown(user_prompt)
+        reasoning_prompt = user_prompt
+        if reasoning_data:
+            fixes_data = analyze_and_improve(
+                ollama_server=OLLAMA_SERVER, 
+                user_prompt="", 
+                snippets_enable=False, 
+                json_chunks_enable=True, 
+                query_text=None, 
+                enable_llminvoke=False
+            )
+            reasoning_prompt += fixes_data["reasoning_prompt"]
+        
+        with st.spinner("Waiting for LLM reply..."):
+            reply = orchestrate_with_safe_invoke(
+                reasoning_prompt,
+                os.path.join(skills_dir, skill_choice, "SKILL.md"),
+                os.getenv("REASONING_AGENT"),
+                OLLAMA_SERVER
+            )
+
+        history.add_ai_message(reply)
+        st.chat_message("assistant").markdown(reply)
+
+        # Update flags
+        st.session_state.waiting_reply = False
+        st.session_state.reply_done = True
+
+    # Show status
+    if st.session_state.waiting_reply:
+        st.info("⏳ Waiting for reply...")
+    elif st.session_state.reply_done:
+        st.success("✅ Reply received and displayed.")
+
 
 if __name__ == "__main__":
     # Example old vs new code

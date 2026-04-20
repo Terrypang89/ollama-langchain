@@ -27,6 +27,48 @@ enc = tiktoken.get_encoding("cl100k_base")
 MAX_TOKENS = 32768
 _ctx_cache = {}
 
+# In your Streamlit app:
+# import streamlit as st
+# from langchain.llms import OpenAI
+# from langchain.chains import LLMChain
+# from langchain.prompts import PromptTemplate
+
+class StreamlitBrainstorming:
+    def __init__(self):
+        self.context = ""
+        self.questions = []
+        self.approaches = []
+        self.design_sections = []
+        self.current_step = 0
+        
+    def explore_context(self, project_path):
+        # Analyze project files, recent commits, documentation
+        pass
+        
+    def ask_question(self, question, options=None):
+        # Present one question at a time
+        st.write(f"**Question:** {question}")
+        if options:
+            return st.radio("Choose:", options)
+        return st.text_input("Your response:")
+        
+    def propose_approaches(self, approaches):
+        # Present 2-3 approaches with trade-offs
+        for i, approach in enumerate(approaches):
+            st.write(f"**Approach {i+1}: {approach['name']}")
+            st.write(f"**Pros:** {approach['pros']}")
+            st.write(f"**Cons:** {approach['cons']}")
+            st.write(f"**Recommendation:** {approach['recommendation']}")
+            
+    def present_design(self, sections):
+        # Present design sections
+        for section in sections:
+            st.subheader(section['title'])
+            st.write(section['content'])
+
+# Initialize in your Streamlit app
+# brainstorming = StreamlitBrainstorming()
+
 class JSONMemory:
     def __init__(self, path="memory.json"):
         self.path = path
@@ -49,6 +91,76 @@ class JSONMemory:
     def _save(self, data):
         with open(self.path, "w") as f:
             json.dump(data, f, indent=2)
+
+def run_action(action, target, code_block=None):
+    if action == "execute":
+        if target.endswith(".sh"):
+            result = subprocess.run(["bash", target], capture_output=True, text=True)
+            return result.stdout
+        elif target.endswith(".js") or target.endswith(".cjs"):
+            result = subprocess.run(["node", target], capture_output=True, text=True)
+            return result.stdout
+        elif target.endswith(".py"):
+            result = subprocess.run(["python", target], capture_output=True, text=True)
+            return result.stdout
+        elif code_block:
+            cmd = code_block.split()[0]
+            if cmd not in SAFE_COMMANDS:
+                return f"Blocked unsafe command: {cmd}"
+            result = subprocess.run(code_block, shell=True, capture_output=True, text=True)
+            return result.stdout
+    elif action == "include":
+        with open(target, encoding="utf-8") as f:
+            return f.read()
+    return None
+
+# --- Parse directives from LLM reply ---
+def parse_directives(reply_text):
+    actions = []
+    for line in reply_text.splitlines():
+        if line.startswith("execute:"):
+            script = line.split(":",1)[1].strip()
+            actions.append(("execute", script))
+        elif line.startswith("include:"):
+            file = line.split(":",1)[1].strip()
+            actions.append(("include", file))
+        elif line.startswith("ask_user:"):
+            question = line.split(":",1)[1].strip()
+            actions.append(("ask_user", question))
+    return actions
+
+def call_superpowers_js(manifest_path):
+    result = subprocess.run(
+        ["node", ".opencode/plugins/superpowers.js", manifest_path],
+        capture_output=True, text=True
+    )
+    return result.stdout
+
+def load_all_skills_name(base_dir="skills"):
+    skills_namelist = []
+    for skill_dir in glob.glob(os.path.join(base_dir, "*")):
+        if os.path.isdir(skill_dir):
+            skill_file = os.path.join(skill_dir, "SKILL.md")
+            if os.path.exists(skill_file):
+                name = os.path.basename(skill_dir)  # use folder name as skill name
+                skills_namelist.append(name)
+    return skills_namelist
+
+
+def load_skill_manifests(skill_dir="skills/brainstorming"):
+    manifests = {}
+    for path in glob.glob(os.path.join(skill_dir, "*.md")):
+        name = os.path.splitext(os.path.basename(path))[0]
+        with open(path, encoding="utf-8") as f:
+            manifests[name] = f.read()
+    return manifests
+
+def call_brainstorm_server(prompt):
+    url = "http://localhost:5000/brainstorm"
+    payload = {"prompt": prompt}
+    resp = requests.post(url, json=payload)
+    resp.raise_for_status()
+    return resp.json()
 
 def beautify_text_area(raw_data):
     # 1. Handle empty or None data immediately
@@ -154,6 +266,30 @@ def safe_invoke_ollama(prompt: str, model_name: str, base_url: str, margin: floa
             print(f"Elapsed for chunk {idx+1}: {elapsed:.2f} seconds")
             responses.append(resp)
         return "\n".join(responses)
+
+def orchestrate_with_safe_invoke(prompt, skill_file, model_name, base_url):
+    # Step 1: Load SKILL.md
+    skill_doc = open(skill_file).read()
+    context = skill_doc + "\n\nUser prompt:\n" + prompt
+
+    # Step 2: Call Ollama safely
+    llm_reply = safe_invoke_ollama(context, model_name, base_url)
+
+    # Step 3: Parse directives from LLM reply
+    actions = parse_directives(llm_reply)
+    results = []
+    for action, target in actions:
+        if action == "ask_user":
+            user_answer = st.text_input(f"LLM requests input: {target}")
+            results.append(f"User answered: {user_answer}")
+        else:
+            output = run_action(action, target)
+            results.append(f"{action} {target}:\n{output}")
+
+    # Step 4: Feed results back into Ollama
+    next_context = llm_reply + "\n\nResults:\n" + "\n".join(results)
+    final_reply = safe_invoke_ollama(next_context, model_name, base_url)
+    return final_reply
 
 def copyfiles(code_repo, mq5_file, header_file, mql5_path):
     """
@@ -645,36 +781,8 @@ def load_params_from_ini(ini_file):
     params = dict(config["Tester"])
     return params
 
-# def save_run_metadata(run_id, ea_name, parameters, archieve_folder,
-#                       report_files, log_file, vector_ids, summary):
-#     """
-#     Save run metadata into metadata.json inside archieve folder.
-#     Parameters are loaded from ini file.
-#     """
-#     metadata = {
-#         "run_id": run_id,
-#         "run_id_num": 0,
-#         "ea_name": ea_name,
-#         "parameters": parameters,   # dict from ini file
-#         "archieve_folder": archieve_folder,
-#         "report_files": report_files,
-#         "log_file": log_file,
-#         "vector_ids": vector_ids,
-#         "summary": summary            # dict from parse_backtest_report
-#     }
-
-#     metadata_path = os.path.join(archieve_folder, "metadata.json")
-#     with open(metadata_path, "w", encoding="utf-8") as f:
-#         json.dump(metadata, f, indent=4)
-
-#     print(f"Saved metadata.json for run {run_id}")
-
-def save_run_and_update_memory(run_id, parameters, archieve_folder,
-                               report_files, log_file, vector_ids):
-    """
-    Save run metadata into metadata.json and update memory.json with latest run info.
-    """
-
+def save_run_and_update_memory(run_id, parameters, archieve_folder, report_files, log_file, vector_ids):
+    
     metadata = {
         "run_id": run_id,
         "run_id_num": 0,
@@ -687,26 +795,11 @@ def save_run_and_update_memory(run_id, parameters, archieve_folder,
         },
         "vector_db": vector_ids,
     }
-
     # --- Save metadata.json inside archive folder ---
     os.makedirs(archieve_folder, exist_ok=True)
     metadata_path = Path(archieve_folder) / "metadata.json"
     metadata_num = 0
 
-    # if metadata_path.exists():
-    #     existing = json.loads(metadata_path.read_text(encoding="utf-8"))
-    #     # get run_id 
-    #     # metadata["run_id_num"] = 0
-    #     # if isinstance(existing, list):
-           
-    #     #     existing.insert(0, metadata)  # prepend new run
-    #     # else:
-    #     #     metadata["run_id_num"] = 0
-    #     #     existing = [metadata]
-        
-    #     metadata_path.write_text(json.dumps({0:existing}, indent=4, ensure_ascii=False), encoding="utf-8")
-    # else:
-    #     metadata_path.write_text(json.dumps([metadata], indent=4, ensure_ascii=False), encoding="utf-8")
     metadata_path = os.path.join(archieve_folder, "metadata.json")
     with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=4)
@@ -1110,62 +1203,7 @@ def load_snippets(ollama_server, model_name):
         print("❌ Failed to create snippet archieve.")
         return {}, archieve_dir, run_id
 
-# def get_latest_snippet_json_data(snippet_state: str, need_content=True):
-    # """
-    # Retrieve the latest snippet content for a given state from the archive JSON.
-    # Returns (content, archive_dir, run_id).
-    # """
-    # info = get_last_run_info()
-    # run_id = info["run_id"]
-    # run_id_num = info["run_id_num"]
-
-    # archive_dir = info.get("archive") or info.get("archieve")
-    # if not archive_dir:
-    #     raise KeyError("❌ Archive directory not found in get_last_run_info() result")
-
-    # archive_file = os.path.join(archive_dir, f"snippets_{run_id}.json")
-
-    # if not os.path.exists(archive_file):
-    #     print(f"❌ Archive file {archive_file} not found.")
-    #     return {}, archive_dir, run_id
-
-    # try:
-    #     with open(archive_file, "r", encoding="utf-8") as f:
-    #         json_snippets = json.load(f)
-    # except json.JSONDecodeError:
-    #     print(f"❌ Failed to parse JSON {archive_file}.")
-    #     return {}, archive_dir, run_id
-
-    # # ✅ Ensure "history" exists
-    # history = json_snippets.get("history", {})
-    # if not isinstance(history, dict):
-    #     history = {}
-
-    # if run_id not in history:
-    #     print(f"❌ No entry for run_id {run_id} in {archive_file}.")
-    #     return {}, archive_dir, run_id
-
-    # latest_entry = history[run_id]
-
-    # if run_id_num not in latest_entry:
-    #     print(f"❌ No entry for run_id_num {run_id_num} in {latest_entry}.")
-    #     return {}, archive_dir, run_id
-
-    # latest_entry_mit_num = latest_entry[run_id_num]
-    
-    # # latest_entry = latest_entry[run_id_num]
-    # section = latest_entry_mit_num.get(snippet_state)
-
-    # if section:
-    #     if need_content and "content" in section:
-    #         return section["content"], archive_dir, run_id
-    #     elif not need_content:
-    #         return section, archive_dir, run_id
-
-    # print(f"❌ Failed to get snippet '{snippet_state}' from run_id {run_id}.")
-    # return {}, archive_dir, run_id
-
-def get_latest_snippet_json_data(snippet_state: str, need_content=True, json_run_id_with_num=False):
+def get_latest_snippet_json_data(snippet_state: str, need_content=True, json_run_id_with_num=False, fetch_previous=False):
     """
     Retrieve the latest snippet content for a given state from the archive JSON.
     Returns (content, archive_dir, run_id).
@@ -1287,6 +1325,12 @@ def store_history_snippets_json(snippet_name, snippet_data, chunks_only=True, ne
     print(f"✅ Updated snippets archive at {archive_file}")
     return str(archive_file)
 
+def load_json_safe(path):
+    text = Path(path).read_text(encoding="utf-8")
+    # remove illegal trailing commas before ] or }
+    text = re.sub(r",(\s*[\]}])", r"\1", text)
+    return json.loads(text)
+
 def join_json_chunks(section: str = None, previous_enable = False) -> str:
     """
     Load chunks from a JSON archive for the last run_id.
@@ -1311,7 +1355,8 @@ def join_json_chunks(section: str = None, previous_enable = False) -> str:
         print(f"❌ Archive file {json_file} not found.")
         return ""
 
-    archive = json.loads(Path(json_file).read_text(encoding="utf-8"))
+    # archive = json.loads(Path(json_file).read_text(encoding="utf-8"))
+    archive = load_json_safe(Path(json_file))
     latest_data = archive.get("raw_data", {}).get(run_id, {})
 
     # ✅ Get the dict for this run_id_num
@@ -1331,14 +1376,23 @@ def join_json_chunks(section: str = None, previous_enable = False) -> str:
             all_chunks.extend(sec_data.get("chunks", []))
         return "\n".join(all_chunks)
 
-def analyze_and_improve(ollama_server, user_prompt, snippets_enable=False, json_chunks_enable=False, query_text=None):
+def analyze_and_improve(
+    ollama_server, 
+    user_prompt, 
+    snippets_enable=False, 
+    json_chunks_enable=False, 
+    query_text=None, 
+    enable_llminvoke=True
+):
     info = get_last_run_info()
     run_id = info.get("run_id")
     start = time.perf_counter()
     model_name = os.getenv("REASONING_AGENT")
     print("start analyze_and_improve")
+    reasoning_prompt = ""
 
-    reasoning_prompt = f"""{user_prompt}"""
+    if user_prompt:
+        reasoning_prompt += f"""{user_prompt}"""
 
     if snippets_enable:
         data, archieve_dir, run_id = load_snippets(ollama_server, model_name)
@@ -1400,18 +1454,22 @@ def analyze_and_improve(ollama_server, user_prompt, snippets_enable=False, json_
         {join_json_chunks("mq5_code")}
         mqh_header:
         {join_json_chunks("mqh_header")}
+        backtested_log:
+        {join_json_chunks("log")}
         """
 
         # check if any latest_patch and 
         # if 
 
+    analysis = ""
     # Always run analysis
-    reasoning_prompt_token = count_tokens(reasoning_prompt, model_name, False)
-    print(f"perform reasoning_prompt with total token of {reasoning_prompt_token} for analysis.")
-    start = time.perf_counter()
-    analysis = safe_invoke_ollama(reasoning_prompt, model_name, ollama_server)
-    elapsed = time.perf_counter() - start
-    print(f"analysis: {analysis} with {elapsed:.2f} seconds")
+    if enable_llminvoke:
+        reasoning_prompt_token = count_tokens(reasoning_prompt, model_name, False)
+        print(f"perform reasoning_prompt with total token of {reasoning_prompt_token} for analysis.")
+        start = time.perf_counter()
+        analysis = safe_invoke_ollama(reasoning_prompt, model_name, ollama_server)
+        elapsed = time.perf_counter() - start
+        print(f"analysis: {analysis} with {elapsed:.2f} seconds")
 
     return {
         "reasoning_prompt": reasoning_prompt,
@@ -1520,29 +1578,29 @@ def suggest_code_improvements(
 
     # --- Build coder prompt ---
     reasoning_coder_prompt = f"""Based on last reasoning prompt:\n{last_reasoning_prompt}\n
-and based on last reasoning prompt analysis result:\n{analysis}\n
-"""
+    and based on last reasoning prompt analysis result:\n{analysis}\n
+    """
 
     if fetch_snippets_enable:
         reasoning_coder_prompt += f"""
-mql5 source code: {" ".join(str(s) for s in code_snippets)}\n
-header source code: {" ".join(str(s) for s in header_snippets)}\n
-"""
+    mql5 source code: {" ".join(str(s) for s in code_snippets)}\n
+    header source code: {" ".join(str(s) for s in header_snippets)}\n
+    """
     else:
         reasoning_coder_prompt += f"""
-mq5_code:\n{join_json_chunks("mq5_code")}\n
-mqh_header:\n{join_json_chunks("mqh_header")}\n
-"""
+    mq5_code:\n{join_json_chunks("mq5_code")}\n
+    mqh_header:\n{join_json_chunks("mqh_header")}\n
+    """
 
     if compile_error_enable and compile_error:
         reasoning_coder_prompt += f"""
-patch files list: {patch_files_list}\n
-metatrader 5 compile errors: {compile_error}\n
-"""
+    patch files list: {patch_files_list}\n
+    metatrader 5 compile errors: {compile_error}\n
+    """
 
     reasoning_coder_prompt += f"""
-{coder_prompt}\n
-"""
+    {coder_prompt}\n
+    """
 
     print("generating code ...")
     start = time.perf_counter()
