@@ -548,12 +548,12 @@ def update_ini_file(
         "ExecutionMode": "0",
         "OptimizationCriterion": "0",
         "Visual": int(visual),
-        "ShutdownTerminal": "true",
-        "ReplaceReport": "true",
+        "ShutdownTerminal": "1",
+        "ReplaceReport": "1",
         "Report": report_path,   # ✅ ensure Report is always present
     }
 
-    with open(ini_path, "r") as f:
+    with open(ini_path, "r", encoding="utf-16") as f:
         lines = f.readlines()
 
     new_lines = []
@@ -595,11 +595,13 @@ def update_ini_file(
                 print("  " + m.strip())
         new_lines = new_lines[:tester_end_index] + missing + new_lines[tester_end_index:]
 
-    with open(ini_path, "w") as f:
+    # with open(ini_path, "w") as f:
+    #     f.writelines(new_lines)
+    with open(ini_path, "w", encoding="utf-16", newline="\r\n") as f:
         f.writelines(new_lines)
 
     print("Updated ini file:", ini_path)
-    return ini_path
+    return str(ini_path)
 
 def run_mt5_backtest(config_path, terminal_path, report_path, log_path, store_path,
                      portable_enable=True, timeout=60):
@@ -613,7 +615,7 @@ def run_mt5_backtest(config_path, terminal_path, report_path, log_path, store_pa
 
     # --- Extract report path from ini file ---
     report_file = None
-    with open(config_path, "r") as f:
+    with open(config_path, "r", encoding="utf-16") as f:
         for line in f:
             if line.strip().lower().startswith("report="):
                 report_file = line.strip().split("=", 1)[1].strip()
@@ -621,6 +623,7 @@ def run_mt5_backtest(config_path, terminal_path, report_path, log_path, store_pa
 
     if report_file and not os.path.isabs(report_file):
         report_file = os.path.join(report_path, report_file)
+        print(f"get full report_file:{report_file}")
 
     # --- Cleanup old report variants ---
     if report_file:
@@ -693,7 +696,8 @@ def run_mt5_backtest(config_path, terminal_path, report_path, log_path, store_pa
                 shutil.copy(f, archieve_folder)
         if latest_log_file and os.path.exists(latest_log_file):
             shutil.copy(latest_log_file, archieve_folder)
-    print("done backtesting.")
+            print(f"copied latest_log_file:{latest_log_file} to archieve_folder:{archieve_folder}")
+    print(f"done backtesting with run_id:{run_id}, archieve_folder:{archieve_folder}, report_file:{report_file}, latest_log_file:{latest_log_file}")
     return run_id, archieve_folder, report_file, latest_log_file
 
 def report_tables_to_json(report_file, archieve_folder, output_json="report_tables.json"):
