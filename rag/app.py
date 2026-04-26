@@ -11,8 +11,9 @@ from langchain_community.chat_message_histories import StreamlitChatMessageHisto
 from cleanstore import clean_store, clean_snippets_json
 from testMT5 import update_ini_file, run_mt5_backtest, copyfiles, compile_ea, extract_errors, count_tokens, load_all_skills_name, \
 report_tables_to_json, load_params_from_ini, store_history_snippets_json, apply_patch_to_git, get_patch_content, process_run_for_embeddings, \
-save_run_and_update_memory, generate_patch_from_git, get_latest_snippet_json_data, beautify_text_area, find_patch_history, \
-extract_tester_report_summary, analyze_and_improve, clean_log, suggest_code_improvements, compile_fail_update_memory, orchestrate_with_safe_invoke
+save_run_and_update_memory, generate_patch_from_git, get_latest_snippet_json_data, beautify_text_area, find_patch_history, get_log_attributes, \
+extract_tester_report_summary, analyze_and_improve, clean_log, suggest_code_improvements, compile_fail_update_memory, orchestrate_with_safe_invoke, \
+build_dataframe_from_log
 
 load_dotenv()
 OLLAMA_SERVER = os.getenv("OLLAMA_API_BASE")
@@ -156,6 +157,9 @@ def preview_improvements():
                 st.session_state["ini_file"] = ini_file
                 st.session_state["summary"] = summary
 
+                # get attributes from log
+                st.session_state["log_attributes"] = get_log_attributes(clean_log_file)
+
             except Exception as e:
                 st.error(f"Backtest failed: {e}")
 
@@ -174,13 +178,27 @@ def preview_improvements():
         faiss_embedded_enable = st.checkbox("🔍 FAISS mebedded", value=True)
         Store_submitted = st.form_submit_button("Store to Vector Store")
 
+        # Step 1: Get attributes
+        st.subheader("Select Attributes from Log")
+        if st.session_state.get("log_attributes"):
+            # Step 2: Show checkboxes
+            selected_attributes = []
+            for attr in st.session_state["log_attributes"]:
+                if st.checkbox(f" {attr}", value=True):
+                    selected_attributes.append(attr)
+
         if Store_submitted:
             try:
+                
                 run_id = st.session_state.get("run_id")
                 archieve_folder = st.session_state.get("archieve_folder")
                 json_report_file = st.session_state.get("json_report_file")
                 clean_log_file = st.session_state.get("clean_log_file")
                 ini_file = st.session_state.get("ini_file")
+
+                # Step 3: Build DataFrame with selected attributes
+                df_filtered = build_dataframe_from_log(st.session_state["clean_log_file"], selected_attributes, st.session_state["archieve_folder"])
+                # st.dataframe(df_filtered)
 
                 if not all([run_id, archieve_folder, json_report_file, clean_log_file, ini_file]):
                     st.warning("⚠️ Please run a backtest first before storing to vector store.")

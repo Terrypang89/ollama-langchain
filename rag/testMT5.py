@@ -27,12 +27,6 @@ enc = tiktoken.get_encoding("cl100k_base")
 MAX_TOKENS = 32768
 _ctx_cache = {}
 
-# In your Streamlit app:
-# import streamlit as st
-# from langchain.llms import OpenAI
-# from langchain.chains import LLMChain
-# from langchain.prompts import PromptTemplate
-
 class StreamlitBrainstorming:
     def __init__(self):
         self.context = ""
@@ -65,9 +59,6 @@ class StreamlitBrainstorming:
         for section in sections:
             st.subheader(section['title'])
             st.write(section['content'])
-
-# Initialize in your Streamlit app
-# brainstorming = StreamlitBrainstorming()
 
 class JSONMemory:
     def __init__(self, path="memory.json"):
@@ -145,7 +136,6 @@ def load_all_skills_name(base_dir="skills"):
                 name = os.path.basename(skill_dir)  # use folder name as skill name
                 skills_namelist.append(name)
     return skills_namelist
-
 
 def load_skill_manifests(skill_dir="skills/brainstorming"):
     manifests = {}
@@ -291,6 +281,118 @@ def orchestrate_with_safe_invoke(prompt, skill_file, model_name, base_url):
     final_reply = safe_invoke_ollama(next_context, model_name, base_url)
     return final_reply
 
+# def get_log_attributes(log_file: str, target_minute: str = "01:05"):
+#     """
+#     Find the first detection of target_minute (ignoring date),
+#     capture the actual date, and return attributes for that block.
+#     Example target_minute: '01:05'
+#     """
+#     attributes_set = set()
+#     detected_time = None
+
+#     for line in Path(log_file).read_text(encoding="utf-8").splitlines():
+#         # Match timestamp pattern
+#         ts_match = re.match(r"(\d{4}\.\d{2}\.\d{2} \d{2}:\d{2}):\d{2}", line)
+#         if not ts_match:
+#             continue
+
+#         # Extract date+minute and minute only
+#         full_time = ts_match.group(1)  # e.g. '2025.03.03 01:05'
+#         minute_only = full_time.split(" ")[1]  # e.g. '01:05'
+
+#         if minute_only == target_minute:
+#             if detected_time is None:
+#                 detected_time = full_time  # lock onto first detection
+#             if line.startswith(detected_time):
+#                 for kv in re.findall(r"(\w+):([-\d\.]+)", line):
+#                     key, _ = kv
+#                     attributes_set.add(key)
+#         elif detected_time:
+#             # stop scanning once we move past the target minute block
+#             break
+
+#     return detected_time, sorted(attributes_set)
+
+def get_log_attributes(log_file: str, target_minute: str = "01:05"):
+    """
+    Find the first detection of target_minute (ignoring date),
+    capture the actual date, and return attributes for that block.
+    Attributes are words before ':' or '['.
+    Timeframe suffixes (_M5, _M15, _M30, _H1, _H4, _D1, _W1) are removed.
+    """
+    attributes_set = set()
+    detected_time = None
+    suffixes = ("_M5","_M15","_M30","_H1","_H4","_D1","_W1")
+
+    for line in Path(log_file).read_text(encoding="utf-8").splitlines():
+        # Match timestamp up to minutes
+        ts_match = re.match(r"(\d{4}\.\d{2}\.\d{2} \d{2}:\d{2}):\d{2}", line)
+        if not ts_match:
+            continue
+
+        full_time = ts_match.group(1)  # e.g. '2025.03.03 01:05'
+        minute_only = full_time.split(" ")[1]  # e.g. '01:05'
+
+        if minute_only == target_minute:
+            if detected_time is None:
+                detected_time = full_time  # lock onto first detection
+            if line.startswith(detected_time):
+                # Attributes before ":" or before "["
+                for kv in re.findall(r"(\w+)(?=:|\[)", line):
+                    for suf in suffixes:
+                        if kv.endswith(suf):
+                            kv = kv[:-len(suf)]
+                    # skip numeric-only attributes
+                    if kv.isdigit():
+                        continue
+                    attributes_set.add(kv)
+        elif detected_time:
+            # stop scanning once we move past the target minute block
+            break
+
+    return sorted(attributes_set)
+
+def build_dataframe_from_log(log_file: str, selected_attributes: list, archieve_folder: str):
+    """
+    Parse a log file, build a DataFrame, and filter to selected attributes.
+    """
+    rows = []
+    for line in Path(log_file).read_text(encoding="utf-8").splitlines():
+        ts_match = re.match(r"(\d{4}\.\d{2}\.\d{2} \d{2}:\d{2}:\d{2})", line)
+        if not ts_match:
+            continue
+        timestamp = ts_match.group(1)
+
+        # extract category
+        cat_match = re.search(r"\[(.*?)\]", line)
+        category = cat_match.group(1) if cat_match else "Unknown"
+
+        # extract metrics
+        metrics = {}
+        for kv in re.findall(r"(\w+):([-\d\.]+)", line):
+            key, val = kv
+            if key in selected_attributes:  # only keep chosen attributes
+                metrics[key] = float(val)
+
+        rows.append({"datetime": timestamp, "timeframe": category, **metrics})
+
+    df = pd.DataFrame(rows)
+    # --- Save to archive folder ---
+    archive_path = Path(archieve_folder)
+    archive_path.mkdir(parents=True, exist_ok=True)  # ensure folder exists
+
+    # Save as CSV
+    csv_file = archive_path / "filtered_log.csv"
+    df.to_csv(csv_file, index=False, encoding="utf-8")
+    print(f"✅ DataFrame stored as CSV at {csv_file}")
+
+    # # Save as Excel (optional)
+    # excel_file = archive_path / "filtered_log.xlsx"
+    # df.to_excel(excel_file, index=False, engine="openpyxl")
+    # print(f"✅ DataFrame stored as Excel at {excel_file}")
+
+    return df
+
 def copyfiles(code_repo, mq5_file, header_file, mql5_path):
     """
     Copy EA (.mq5) and header (.mqh) files from the code repo into the MQL5 directory.
@@ -349,7 +451,7 @@ def extract_errors(compile_output: str) -> list[str]:
             errors.append(line.strip())
     return errors
 
-def compile_ea(mq5_file, metaeditor_path):
+def compile_ea(mq5_file: str, metaeditor_path: str):
     """
     Compile an EA and return the log content.
     """
