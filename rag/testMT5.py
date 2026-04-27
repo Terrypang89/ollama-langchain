@@ -20,6 +20,7 @@ from typing import List
 import tiktoken
 import chardet
 import superpower
+from collections import defaultdict
 
 # Initialize tokenizer (cl100k_base works well for LLaMA‑style models)
 enc = tiktoken.get_encoding("cl100k_base")
@@ -351,6 +352,123 @@ def get_log_attributes(log_file: str, target_minute: str = "01:05"):
             break
 
     return sorted(attributes_set)
+
+ATTRIBUTE_GROUPS = {
+    "attributes_timeframe": [
+        "W_stage","diffMid_Trend","BBUpDn","trend","prev_trend","diffMid",
+        "diffBBW","WLV","MidLV","UppLV","LowLV","close","high","low"
+    ],
+    "attributes_TRADEINFO": [
+        "H2L_flyUP","H2L_flyDN","H2L_flyStrink","H2L_sideway",
+        "L2H_flyUP","L2H_flyDN","L2H_flyStrink","L2H_sideway"
+    ],
+    "attributes_ORDERINFO": [
+        "BUY_PROFIT","BUY_LOTS","SELL_PROFIT","SELL_LOTS","BUY_TICKET_NUM",
+        "SELL_TICKET_NUM","BUYS","SELLS","TOTALORDERS"
+    ],
+    "attributes_ATRSL1buf": [
+        "dir","Trend","LV","Upper","Lower","ATRSLMid","ATR_val"
+    ],
+    "attributes_AllTF": [
+        "HTF_Drive_LTF_Sideway","LTF_Drive_HTF_Fly","HTL_flyDN",
+        "line_seq_touch","line_seq_cross","untouch_val","Midline_cross"
+    ],
+    "attributes_NEWORDEROPEN": [
+        "TradeAct","OPEN_TICKET","OPEN_Type","OPEN_LOTS","OPEN_PRICE","OPEN_TIME",
+        "CLOSED_TICKET","CLOSED_TYPE","CLOSED_LOT","CLOSED_PRICE","PROFIT","SWAP",
+        "COMMISSION","FEE","TOTAL_PROFIT","TOTAL_SWAP","LAST_PROFIT"
+    ],
+    "attributes_NEWORDERCLOSE": [
+        "TradeAct","OPEN_TICKET","OPEN_Type","OPEN_LOTS","DEAL_PRICE",
+        "FREEMARGIN","MARGINREQUIRED"
+    ]
+}
+
+def clean_attribute(key: str) -> str:
+    """Remove timeframe suffix (_M5, _M15, etc.) from attribute names."""
+    return re.sub(r'_(M5|M15|M30|H1|H4|D1|W1)$', '', key)
+
+def try_cast(x: str):
+    """Convert to float if possible, else return string."""
+    x = x.lstrip("[")  # strip stray leading “[”
+    try:
+        return float(x)
+    except ValueError:
+        return x
+
+def parse_alltf(val: str):
+    result = {}
+    val = val.strip().lstrip("[").rstrip("]")
+
+    tokens = [t.strip() for t in val.split(',') if t.strip()]
+    for tok in tokens:
+        m = re.match(r'([A-Z0-9]+)_(.+)', tok)
+        if m:
+            tf, num = m.groups()
+            num = num.split(',')[0].strip()
+            result[tf] = num
+    return result
+
+def parse_value(val: str, keep_array=False):
+    """
+    Extract values from arrays.
+    - If keep_array=True (for AllTF), return full array.
+    - Otherwise, return only the first numeric/string value.
+    - Remove leading keyword in parentheses and stray “[”.
+    """
+    val = re.sub(r'^\([^)]*\)', '', val).strip()
+
+    arr_match = re.search(r'\[([^\]]+)\]', val)
+    if arr_match:
+        nums = [n.strip().lstrip("[") for n in arr_match.group(1).split(',') if n.strip()]
+        if keep_array:
+            return [try_cast(n) for n in nums]
+        else:
+            return try_cast(nums[0]) if nums else None
+    else:
+        return try_cast(val)
+
+def truncate_to_minute(timestamp: str) -> str:
+    """Drop seconds from timestamp, keep only YYYY.MM.DD HH:MM."""
+    return timestamp[:-3]
+
+def build_nested_structure(log_file: str, archive_folder: str):
+    data = defaultdict(lambda: defaultdict(dict))
+
+    for line in Path(log_file).read_text(encoding="utf-8").splitlines():
+        ts_match = re.match(r"(\d{4}\.\d{2}\.\d{2} \d{2}:\d{2}:\d{2})", line)
+        if not ts_match:
+            continue
+        timestamp = truncate_to_minute(ts_match.group(1))
+
+        tf_match = re.search(r"\[(.*?)\]", line)
+        if not tf_match:
+            continue
+        timeframe = tf_match.group(1)
+        for raw_key, raw_val in re.findall(r"(\w+):(\[.*?\])", line):
+            attr_name = clean_attribute(raw_key)
+
+            if attr_name.isdigit():
+                continue
+
+            if timeframe == "AllTF":
+                # raw_val here is the whole "[M5_8-7,8, M15_0-9,9, ...]"
+                val = parse_alltf(raw_val)
+            else:
+                val = parse_value(raw_val)
+
+            if val is not None:
+                data[timestamp][timeframe][attr_name] = val
+
+
+    archive_path = Path(archive_folder)
+    archive_path.mkdir(parents=True, exist_ok=True)
+    json_file = archive_path / "filtered_log.json"
+    with open(json_file, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+    print(f"✅ Cleaned JSON stored at {json_file}")
+    return data
 
 def build_dataframe_from_log(log_file: str, selected_attributes: list, archieve_folder: str):
     """
