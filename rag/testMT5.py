@@ -19,14 +19,47 @@ import time
 from typing import List
 import tiktoken
 import chardet
-import superpower
 from collections import defaultdict
+from bs4 import BeautifulSoup
 
 # Initialize tokenizer (cl100k_base works well for LLaMA‑style models)
 enc = tiktoken.get_encoding("cl100k_base")
 
 MAX_TOKENS = 32768
 _ctx_cache = {}
+
+ATTRIBUTE_GROUPS = {
+    "attributes_timeframe": [
+        "W_stage","diffMid_Trend","BBUpDn","trend","prev_trend","diffMid",
+        "diffBBW","WLV","MidLV","UppLV","LowLV","close","high","low"
+    ],
+    "attributes_TRADEINFO": [
+        "H2L_flyUP","H2L_flyDN","H2L_flyStrink","H2L_sideway",
+        "L2H_flyUP","L2H_flyDN","L2H_flyStrink","L2H_sideway"
+    ],
+    "attributes_ORDERINFO": [
+        "BUY_PROFIT","BUY_LOTS","SELL_PROFIT","SELL_LOTS","BUY_TICKET_NUM",
+        "SELL_TICKET_NUM","BUYS","SELLS","TOTALORDERS"
+    ],
+    "attributes_ATRSL1buf": [
+        "dir","Trend","LV","Upper","Lower","ATRSLMid","ATR_val"
+    ],
+    "attributes_BBTFImpact": [
+        "HTF_Drive_LTF_Sideway","LTF_Drive_HTF_Fly","HTL_flyDN",
+        "line_seq_touch","line_seq_cross","untouch_val","Midline_cross"
+    ],
+    "attributes_NEWORDEROPEN": [
+        "TradeAct","OPEN_TICKET","OPEN_Type","OPEN_LOTS","OPEN_PRICE","OPEN_TIME",
+        "CLOSED_TICKET","CLOSED_TYPE","CLOSED_LOT","CLOSED_PRICE","PROFIT","SWAP",
+        "COMMISSION","FEE","TOTAL_PROFIT","TOTAL_SWAP","LAST_PROFIT"
+    ],
+    "attributes_NEWORDERCLOSE": [
+        "TradeAct","OPEN_TICKET","OPEN_Type","OPEN_LOTS","DEAL_PRICE",
+        "FREEMARGIN","MARGINREQUIRED"
+    ]
+}
+
+timeframe_cats = {"M5","M15","M30","H1","H4","D1","W1"}
 
 class StreamlitBrainstorming:
     def __init__(self):
@@ -65,7 +98,7 @@ class JSONMemory:
     def __init__(self, path="memory.json"):
         self.path = path
         if not os.path.exists(self.path):
-            with open(self.path, "w") as f:
+            with open(self.path, "w", encoding="utf-8") as f:
                 json.dump({}, f)
 
     def store(self, key, value):
@@ -77,12 +110,22 @@ class JSONMemory:
         return self._load().get(key)
 
     def _load(self):
-        with open(self.path, "r") as f:
-            return json.load(f)
+        with open(self.path, "r", encoding="utf-8") as f:
+            content = f.read()
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError as e:
+            print(f"⚠️ JSON decode error: {e}. Attempting auto-clean.")
+            content = content.replace(",}", "}").replace(",]", "]")
+            return json.loads(content)
 
     def _save(self, data):
-        with open(self.path, "w") as f:
-            json.dump(data, f, indent=2)
+        try:
+            json.dumps(data)  # validate serializable
+        except Exception as e:
+            raise ValueError(f"❌ Data not serializable: {e}")
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4)
 
 def run_action(action, target, code_block=None):
     if action == "execute":
@@ -121,37 +164,36 @@ def parse_directives(reply_text):
             actions.append(("ask_user", question))
     return actions
 
-def call_superpowers_js(manifest_path):
-    result = subprocess.run(
-        ["node", ".opencode/plugins/superpowers.js", manifest_path],
-        capture_output=True, text=True
-    )
-    return result.stdout
+def get_src_file_version(src_file: str):
+    src_file = Path(src_file)
+    with src_file.open("r", encoding="utf-8") as f:
+        content = f.read()
 
-def load_all_skills_name(base_dir="skills"):
-    skills_namelist = []
-    for skill_dir in glob.glob(os.path.join(base_dir, "*")):
-        if os.path.isdir(skill_dir):
-            skill_file = os.path.join(skill_dir, "SKILL.md")
-            if os.path.exists(skill_file):
-                name = os.path.basename(skill_dir)  # use folder name as skill name
-                skills_namelist.append(name)
-    return skills_namelist
+    # Look for: #property version   "22.22"
+    match = re.search(r'#property\s+version\s+"([\d\.]+)"', content)
+    if match:
+        return match.group(1)
+    else:
+        return None
 
-def load_skill_manifests(skill_dir="skills/brainstorming"):
-    manifests = {}
-    for path in glob.glob(os.path.join(skill_dir, "*.md")):
-        name = os.path.splitext(os.path.basename(path))[0]
-        with open(path, encoding="utf-8") as f:
-            manifests[name] = f.read()
-    return manifests
-
-def call_brainstorm_server(prompt):
-    url = "http://localhost:5000/brainstorm"
-    payload = {"prompt": prompt}
-    resp = requests.post(url, json=payload)
-    resp.raise_for_status()
-    return resp.json()
+def get_last_run_info():
+    """Retrieve last run metadata from JSON-based memory."""
+    ltm = JSONMemory(path="memory.json")
+    return {
+        "run_id": ltm.get("LAST_RUN_ID"),
+        'run_id_num': ltm.get("LAST_RUN_ID_NUM"),
+        'run_mq5_version': ltm.get("LAST_RUN_MQ5_VERSION"),
+        "archieve": ltm.get("LAST_RUN_ARCHIEVE"),
+        "rprev_un_id": ltm.get("PREV_LAST_RUN_ID"),
+        'prev_run_id_num': ltm.get("PREV_LAST_RUN_ID_NUM"),
+        "prev_archieve": ltm.get("PREV_LAST_RUN_ARCHIEVE"),
+        "vector_db": {
+            "code_embedding_id": ltm.get("LAST_RUN_CODE_EMBEDDING_ID"),
+            "log_embedding_id": ltm.get("LAST_RUN_LOG_EMBEDDING_ID"),
+            "report_embedding_id": ltm.get("LAST_RUN_REPORT_EMBEDDING_ID"),
+            "header_embedding_id": ltm.get("LAST_RUN_HEADER_EMBEDDING_ID")  # singular for consistency
+        }
+    }
 
 def beautify_text_area(raw_data):
     # 1. Handle empty or None data immediately
@@ -282,38 +324,6 @@ def orchestrate_with_safe_invoke(prompt, skill_file, model_name, base_url):
     final_reply = safe_invoke_ollama(next_context, model_name, base_url)
     return final_reply
 
-# def get_log_attributes(log_file: str, target_minute: str = "01:05"):
-#     """
-#     Find the first detection of target_minute (ignoring date),
-#     capture the actual date, and return attributes for that block.
-#     Example target_minute: '01:05'
-#     """
-#     attributes_set = set()
-#     detected_time = None
-
-#     for line in Path(log_file).read_text(encoding="utf-8").splitlines():
-#         # Match timestamp pattern
-#         ts_match = re.match(r"(\d{4}\.\d{2}\.\d{2} \d{2}:\d{2}):\d{2}", line)
-#         if not ts_match:
-#             continue
-
-#         # Extract date+minute and minute only
-#         full_time = ts_match.group(1)  # e.g. '2025.03.03 01:05'
-#         minute_only = full_time.split(" ")[1]  # e.g. '01:05'
-
-#         if minute_only == target_minute:
-#             if detected_time is None:
-#                 detected_time = full_time  # lock onto first detection
-#             if line.startswith(detected_time):
-#                 for kv in re.findall(r"(\w+):([-\d\.]+)", line):
-#                     key, _ = kv
-#                     attributes_set.add(key)
-#         elif detected_time:
-#             # stop scanning once we move past the target minute block
-#             break
-
-#     return detected_time, sorted(attributes_set)
-
 def get_log_attributes(log_file: str, target_minute: str = "01:05"):
     """
     Find the first detection of target_minute (ignoring date),
@@ -352,37 +362,6 @@ def get_log_attributes(log_file: str, target_minute: str = "01:05"):
             break
 
     return sorted(attributes_set)
-
-ATTRIBUTE_GROUPS = {
-    "attributes_timeframe": [
-        "W_stage","diffMid_Trend","BBUpDn","trend","prev_trend","diffMid",
-        "diffBBW","WLV","MidLV","UppLV","LowLV","close","high","low"
-    ],
-    "attributes_TRADEINFO": [
-        "H2L_flyUP","H2L_flyDN","H2L_flyStrink","H2L_sideway",
-        "L2H_flyUP","L2H_flyDN","L2H_flyStrink","L2H_sideway"
-    ],
-    "attributes_ORDERINFO": [
-        "BUY_PROFIT","BUY_LOTS","SELL_PROFIT","SELL_LOTS","BUY_TICKET_NUM",
-        "SELL_TICKET_NUM","BUYS","SELLS","TOTALORDERS"
-    ],
-    "attributes_ATRSL1buf": [
-        "dir","Trend","LV","Upper","Lower","ATRSLMid","ATR_val"
-    ],
-    "attributes_AllTF": [
-        "HTF_Drive_LTF_Sideway","LTF_Drive_HTF_Fly","HTL_flyDN",
-        "line_seq_touch","line_seq_cross","untouch_val","Midline_cross"
-    ],
-    "attributes_NEWORDEROPEN": [
-        "TradeAct","OPEN_TICKET","OPEN_Type","OPEN_LOTS","OPEN_PRICE","OPEN_TIME",
-        "CLOSED_TICKET","CLOSED_TYPE","CLOSED_LOT","CLOSED_PRICE","PROFIT","SWAP",
-        "COMMISSION","FEE","TOTAL_PROFIT","TOTAL_SWAP","LAST_PROFIT"
-    ],
-    "attributes_NEWORDERCLOSE": [
-        "TradeAct","OPEN_TICKET","OPEN_Type","OPEN_LOTS","DEAL_PRICE",
-        "FREEMARGIN","MARGINREQUIRED"
-    ]
-}
 
 def clean_attribute(key: str) -> str:
     """Remove timeframe suffix (_M5, _M15, etc.) from attribute names."""
@@ -432,6 +411,16 @@ def truncate_to_minute(timestamp: str) -> str:
     """Drop seconds from timestamp, keep only YYYY.MM.DD HH:MM."""
     return timestamp[:-3]
 
+def smart_cast(val: str):
+    """Try to cast to float/int, else return string."""
+    v = val.strip()
+    try:
+        if "." in v:
+            return float(v)
+        return int(v)
+    except ValueError:
+        return val.strip()
+
 def build_nested_structure(log_file: str, archive_folder: str):
     data = defaultdict(lambda: defaultdict(dict))
 
@@ -445,13 +434,44 @@ def build_nested_structure(log_file: str, archive_folder: str):
         if not tf_match:
             continue
         timeframe = tf_match.group(1)
+
+         # --- ORDERINFO branch ---
+        # --- Flat key:value categories ---
+        if timeframe in ("ORDERINFO", "NEW_ORDER_OPEN", "NEW_ORDER_CLOSE"):
+            for raw_key, raw_val in re.findall(r"(\w+):([^,]+)", line):
+            # for raw_key, raw_val in re.findall(r"(\w+):([^\s]+)", line):
+                attr_name = clean_attribute(raw_key)
+                if attr_name.isdigit():
+                    continue
+                # try numeric cast, else keep string
+                try:
+                    val = float(raw_val) if "." in raw_val else int(raw_val)
+                except ValueError:
+                    val = raw_val.strip()
+                data[timestamp][timeframe][attr_name] = val
+            continue
+        # --- TRADEINFO branch ---
+        elif timeframe == "TRADEINFO":
+            # store TRADEINFO under a special key as a list
+            if "TRADEINFO" not in data[timestamp]:
+                data[timestamp]["TRADEINFO"] = []
+            gate_blocks = re.findall(r"Gate:\[([^\]]+)\]([^G]+)", line)
+            for gate_name, attrs in gate_blocks:
+                gate_info = {"Gate": gate_name.strip()}
+                for kv in attrs.strip().split():
+                    if ":" in kv:
+                        k, v = kv.split(":", 1)
+                        gate_info[k] = smart_cast(v)
+                data[timestamp]["TRADEINFO"].append(gate_info)
+            continue
+        # --- BBTFImpact / BB_data branch ---
         for raw_key, raw_val in re.findall(r"(\w+):(\[.*?\])", line):
             attr_name = clean_attribute(raw_key)
 
             if attr_name.isdigit():
                 continue
 
-            if timeframe == "AllTF":
+            if timeframe == "BBTFImpact":
                 # raw_val here is the whole "[M5_8-7,8, M15_0-9,9, ...]"
                 val = parse_alltf(raw_val)
             else:
@@ -460,15 +480,170 @@ def build_nested_structure(log_file: str, archive_folder: str):
             if val is not None:
                 data[timestamp][timeframe][attr_name] = val
 
-
     archive_path = Path(archive_folder)
     archive_path.mkdir(parents=True, exist_ok=True)
-    json_file = archive_path / "filtered_log.json"
+    json_file = archive_path / "filtered_log_json.json"
     with open(json_file, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
     print(f"✅ Cleaned JSON stored at {json_file}")
-    return data
+    return json_file
+
+def reorder_timeframe_attrs(attrs):
+    reordered = []
+    # If first_stage exists, put it first
+    if "first_stage" in attrs:
+        reordered.append("first_stage")
+    # If W_stage exists, ensure it's second
+    if "W_stage" in attrs:
+        # If first_stage not present, insert synthetic first_stage first
+        if "first_stage" not in attrs:
+            reordered.append("first_stage")  # synthetic placeholder
+        reordered.append("W_stage")
+    # Add the rest in natural order, skipping duplicates
+    for a in attrs:
+        if a not in ("first_stage","W_stage"):
+            reordered.append(a)
+    return reordered
+
+def json_log_to_excel(json_file: str, archive_folder: str, base_name: str = "log_matrix"):
+    with open(json_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    category_attrs = {}
+
+    # --- Pass 1: build unified headers ---
+    for ts, categories in data.items():
+        for cat, content in categories.items():
+            if isinstance(content, dict):
+                attr_names = list(content.keys())
+                if cat in timeframe_cats:
+                    attr_names = reorder_timeframe_attrs(attr_names)
+                category_attrs[cat] = attr_names
+
+            elif cat == "TRADEINFO" and isinstance(content, list):
+                for idx, entry in enumerate(content):
+                    if isinstance(entry, dict):
+                        keys = []
+                        for k in entry.keys():
+                            if k == "cnt":
+                                keys.append("Trade_act")
+                            else:
+                                keys.append(k)
+                        category_attrs[f"TRADEINFO{idx}"] = keys
+
+    # --- Build merged headers without duplicates ---
+    max_cols = max(len(v) for v in category_attrs.values())
+    headers = []
+    seen = set()
+    for i in range(max_cols):
+        parts = []
+        for cat, attrs in category_attrs.items():
+            if i < len(attrs):
+                attr = attrs[i]
+                if attr in seen:
+                    continue
+                parts.append(attr)
+                seen.add(attr)
+        if parts:
+            headers.append("/".join(parts))
+    print("header:", headers)
+
+    # --- Pass 2: Collect values aligned to headers ---
+    rows = []
+    for ts, categories in data.items():
+        for cat, content in categories.items():
+            if isinstance(content, dict):
+                attr_dict = {}
+                for k,v in content.items():
+                    if isinstance(v, dict):
+                        items = [f"{subk}={subv}" for subk, subv in v.items()]
+                        # attr_dict[k] = items if items else []
+                        attr_dict[k] = "{" + "|".join(items) + "}"
+                    else:
+                        attr_dict[k] = v   # don’t wrap in str()
+
+                row = {"datetime": ts, "category": cat}
+                for i,h in enumerate(headers, start=1):
+                    attr_names = h.split("/")
+                    val = ""
+                    for name in attr_names:
+                        if name in attr_dict:
+                            val = attr_dict[name]
+                            break
+                    row[f"Col{i}"] = val
+                rows.append(row)
+
+            elif cat == "TRADEINFO" and isinstance(content, list):
+                for idx, entry in enumerate(content):
+                    attr_dict = {}
+                    for k,v in entry.items():
+                        if k == "cnt":
+                            attr_dict["Trade_act"] = str(v)
+                        else:
+                            attr_dict[k] = str(v)
+
+                    row = {"datetime": ts, "category": f"TRADEINFO{idx}"}
+                    for i,h in enumerate(headers, start=1):
+                        attr_names = h.split("/")
+                        val = ""
+                        for name in attr_names:
+                            if name in attr_dict:
+                                val = attr_dict[name]
+                                break
+                        row[f"Col{i}"] = val
+                    rows.append(row)
+
+   # --- Build DataFrame ---
+    df = pd.DataFrame(rows)
+
+    # ensure all ColN exist
+    for i in range(1, len(headers)+1):
+        colname = f"Col{i}"
+        if colname not in df.columns:
+            df[colname] = ""
+
+    ordered_cols = ["datetime","category"]+[f"Col{i}" for i in range(1,len(headers)+1)]
+    df = df[ordered_cols]
+
+    # --- Simplify merged headers using category_attrs ---
+    headers_simple = []
+    seen = set()
+    for i in range(max(len(v) for v in category_attrs.values())):
+        parts = []
+        for cat, attrs in category_attrs.items():
+            if i < len(attrs):
+                attr = attrs[i]
+                # collapse timeframe categories
+                if cat in timeframe_cats:
+                    key = f"TF-{attr}"
+                # collapse TRADEINFO categories
+                # elif cat.startswith("TRADEINFO"):
+                #     key = f"TRADEINFO-{attr}"
+                else:
+                    key = f"{cat}-{attr}"
+                if key not in seen:
+                    parts.append(key)
+                    seen.add(key)
+        if parts:
+            headers_simple.append("/".join(parts))
+
+    # rename ColN to simplified headers
+    df.columns = ["datetime","category"]+headers_simple
+
+    print("headers_simple:", headers_simple)
+
+    # Save
+    archive_path = Path(archive_folder)
+    archive_path.mkdir(parents=True, exist_ok=True)
+
+    csv_path = archive_path / f"{base_name}.csv"
+    xlsx_path = archive_path / f"{base_name}.xlsx"
+
+    df.to_csv(csv_path, index=False, encoding="utf-8")
+    df.to_excel(xlsx_path, index=False, engine="openpyxl")
+
+    return df, csv_path, xlsx_path
 
 def build_dataframe_from_log(log_file: str, selected_attributes: list, archieve_folder: str):
     """
@@ -511,51 +686,99 @@ def build_dataframe_from_log(log_file: str, selected_attributes: list, archieve_
 
     return df
 
-def copyfiles(code_repo, mq5_file, header_file, mql5_path):
+def copyfiles(
+    code_repo: str,
+    mq5_file: str,
+    header_file: str,
+    mql5_path: str,
+    mq5_selected: bool,
+    header_selected: bool,
+    trade_header_selected: bool,
+    backtested_data_selected: bool,
+    copy_to_from: bool,
+):
     """
     Copy EA (.mq5) and header (.mqh) files from the code repo into the MQL5 directory.
+    If src/dst is a directory, copy the entire directory tree.
+    Only copies files if their *_selected flag is True.
     Ensures destination directories exist and prints status messages.
     Returns the latest commit message (or SHA) from the repo if copy succeeds,
     otherwise returns None.
     """
+    info = get_last_run_info()
+    archive_dir = info.get("archive") or info.get("archieve")
+    run_mq5_version = info.get("run_mq5_version")
 
-    files_to_copy = [
-        (os.path.join(code_repo, mq5_file), os.path.join(mql5_path, mq5_file)),
-        (os.path.join(code_repo, header_file), os.path.join(mql5_path, header_file)),
-    ]
+    if not archive_dir:
+        print("❌ Archive directory not found in get_last_run_info() result")
+        return {}, archive_dir, run_id, run_id_num
+
+    project_trade_header_file = os.path.join(r"C:\Users\Tofy3\Project\bb_mtf_strategy", os.getenv("HEADRER_SCRIPT_SUBPATH"))
+    coderepo_trade_header_file = os.path.join(code_repo, os.getenv("TRADE_HEADER_SUBPATH"))
+    mt5_trade_header_file = os.path.join(mql5_path, os.getenv("TRADE_HEADER_SUBPATH"))
+    project_backtested_data_path = os.path.join(r"C:\Users\Tofy3\Project\bb_mtf_strategy", os.path.join(r"references\Backtest_data", run_mq5_version))
+
+    if copy_to_from: 
+        copy_files_path = [ # files_to_MT5_copy
+            (mq5_selected, os.path.join(code_repo, mq5_file), os.path.join(mql5_path, mq5_file)),
+            (header_selected, os.path.join(code_repo, header_file), os.path.join(mql5_path, header_file)),
+            (trade_header_selected, coderepo_trade_header_file, mt5_trade_header_file),
+            (backtested_data_selected, archive_dir, project_backtested_data_path),
+        ]
+    else:
+        copy_files_path = [ # files_from_project_copy
+            (trade_header_selected, project_trade_header_file, coderepo_trade_header_file)
+        ]
 
     success = True
 
-    for src, dst in files_to_copy:
-        if os.path.isfile(src):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            try:
-                shutil.copy(src, dst)
-                print(f"✅ Copied {src} → {dst}")
-            except Exception as e:
-                print(f"❌ Failed to copy {src} → {dst}: {e}")
-                success = False
-        else:
-            print(f"❌ Source file not found: {src}")
-            success = False
+    if copy_files_path:
+        for selected, src, dst in copy_files_path:
+            if not selected:
+                print(f"⏭️ Skipped {src} (not selected)")
+                continue
 
-    if success:
-        try:
-            # Get latest commit SHA and message
-            result = subprocess.run(
-                ["git", "log", "-1", "--pretty=%H %s"],
-                cwd=code_repo,
-                capture_output=True,
-                text=True,
-                check=True
-            )
-            latest_commit = result.stdout.strip()
-            return latest_commit
-        except subprocess.CalledProcessError as e:
-            print(f"❌ Could not retrieve latest commit: {e}")
+            if os.path.isfile(src):
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                try:
+                    shutil.copy(src, dst)
+                    print(f"✅ Copied file {src} → {dst}")
+                except Exception as e:
+                    print(f"❌ Failed to copy file {src} → {dst}: {e}")
+                    success = False
+
+            elif os.path.isdir(src):
+                try:
+                    # Copy entire directory tree
+                    if os.path.exists(dst):
+                        shutil.rmtree(dst)  # remove old copy
+                    shutil.copytree(src, dst)
+                    print(f"📂 Copied directory {src} → {dst}")
+                except Exception as e:
+                    print(f"❌ Failed to copy directory {src} → {dst}: {e}")
+                    success = False
+
+            else:
+                print(f"❌ Source not found: {src}")
+                success = False
+
+        if success:
+            try:
+                result = subprocess.run(
+                    ["git", "log", "-1", "--pretty=%H %s"],
+                    cwd=code_repo,
+                    capture_output=True,
+                    text=True,
+                    check=True
+                )
+                latest_commit = result.stdout.strip()
+                return latest_commit
+            except subprocess.CalledProcessError as e:
+                print(f"❌ Could not retrieve latest commit: {e}")
+                return None
+        else:
             return None
-    else:
-        return None
+
 
 def extract_errors(compile_output: str) -> list[str]:
     """
@@ -634,6 +857,93 @@ def compile_fail_update_memory(base_path=""):
         print(f"❌ Failed to update memory.json: {e}")
         return None
 
+# def update_ini_file(
+#     ini_path,
+#     login,
+#     password,
+#     server,
+#     expert,
+#     symbol="XAUUSD",
+#     period="M5",
+#     from_date="2025.03.01",
+#     to_date="2025.04.01",
+#     deposit=10000,
+#     currency="USD",
+#     leverage="1:100",
+#     visual=False,
+#     report_path=r"C:\Users\Tofy3\Downloads\Tester_report.html",
+# ):
+#     tester_updates = {
+#         "Expert": expert,
+#         "Symbol": symbol,
+#         "Period": period,
+#         "Optimization": "0",
+#         "Model": "0",
+#         "FromDate": from_date,
+#         "ToDate": to_date,
+#         "ForwardMode": "0",
+#         "Deposit": str(deposit),
+#         "Currency": currency,
+#         "ProfitInPips": "0",
+#         "Leverage": leverage,
+#         "ExecutionMode": "0",
+#         "OptimizationCriterion": "0",
+#         "Visual": int(visual),
+#         "ShutdownTerminal": "1",
+#         "ReplaceReport": "1",
+#         "Report": report_path,   # ✅ ensure Report is always present
+#     }
+
+#     with open(ini_path, "r", encoding="utf-16") as f:
+#         lines = f.readlines()
+
+#     new_lines = []
+#     in_tester = False
+#     seen_keys = set()
+#     tester_end_index = None
+
+#     for line in lines:
+#         stripped = line.strip()
+
+#         # Detect section headers
+#         if stripped.startswith("[") and stripped.endswith("]"):
+#             if stripped.lower() == "[tester]":
+#                 in_tester = True
+#             else:
+#                 if in_tester and tester_end_index is None:
+#                     tester_end_index = len(new_lines)  # mark end of Tester section
+#                 in_tester = False
+#             new_lines.append(line)
+#             continue
+
+#         if in_tester and "=" in stripped:
+#             key = stripped.split("=", 1)[0]
+#             if key in tester_updates:
+#                 new_lines.append(f"{key}={tester_updates[key]}\n")
+#                 seen_keys.add(key)
+#                 print(f"Updated attribute: {key}={tester_updates[key]}")
+#             else:
+#                 new_lines.append(line)
+#         else:
+#             new_lines.append(line)
+
+#     # If Tester section ended before TesterInputs, insert missing keys there
+#     if tester_end_index is not None:
+#         missing = [f"{k}={v}\n" for k, v in tester_updates.items() if k not in seen_keys]
+#         if missing:
+#             print("New attributes added to [Tester]:")
+#             for m in missing:
+#                 print("  " + m.strip())
+#         new_lines = new_lines[:tester_end_index] + missing + new_lines[tester_end_index:]
+
+#     # with open(ini_path, "w") as f:
+#     #     f.writelines(new_lines)
+#     with open(ini_path, "w", encoding="utf-16", newline="\r\n") as f:
+#         f.writelines(new_lines)
+
+#     print("Updated ini file:", ini_path)
+#     return str(ini_path)
+
 def update_ini_file(
     ini_path,
     login,
@@ -649,7 +959,15 @@ def update_ini_file(
     leverage="1:100",
     visual=False,
     report_path=r"C:\Users\Tofy3\Downloads\Tester_report.html",
+    version_file=None,   # <-- pass in your MQH file path
 ):
+    # get version from MQH
+    version = get_src_file_version(os.path.normpath(version_file))
+    if version:
+        ord_comment = f"V{version}"
+    else:
+        ord_comment = "VUNKNOWN"
+
     tester_updates = {
         "Expert": expert,
         "Symbol": symbol,
@@ -663,12 +981,12 @@ def update_ini_file(
         "Currency": currency,
         "ProfitInPips": "0",
         "Leverage": leverage,
-        "ExecutionMode": "0",
+        "ExecutionMode": "263",
         "OptimizationCriterion": "0",
         "Visual": int(visual),
         "ShutdownTerminal": "1",
         "ReplaceReport": "1",
-        "Report": report_path,   # ✅ ensure Report is always present
+        "Report": report_path,
     }
 
     with open(ini_path, "r", encoding="utf-16") as f:
@@ -676,20 +994,15 @@ def update_ini_file(
 
     new_lines = []
     in_tester = False
+    in_inputs = False
     seen_keys = set()
-    tester_end_index = None
 
     for line in lines:
         stripped = line.strip()
 
-        # Detect section headers
         if stripped.startswith("[") and stripped.endswith("]"):
-            if stripped.lower() == "[tester]":
-                in_tester = True
-            else:
-                if in_tester and tester_end_index is None:
-                    tester_end_index = len(new_lines)  # mark end of Tester section
-                in_tester = False
+            in_tester = stripped.lower() == "[tester]"
+            in_inputs = stripped.lower() == "[testerinputs]"
             new_lines.append(line)
             continue
 
@@ -698,23 +1011,15 @@ def update_ini_file(
             if key in tester_updates:
                 new_lines.append(f"{key}={tester_updates[key]}\n")
                 seen_keys.add(key)
-                print(f"Updated attribute: {key}={tester_updates[key]}")
             else:
                 new_lines.append(line)
+        elif in_inputs and stripped.startswith("ORDERS_COMMENT="):
+            # overwrite ORDERS_COMMENT with MQH version
+            new_lines.append(f"ORDERS_COMMENT={ord_comment}\n")
+            print(f"Updated ORDERS_COMMENT={ord_comment}")
         else:
             new_lines.append(line)
 
-    # If Tester section ended before TesterInputs, insert missing keys there
-    if tester_end_index is not None:
-        missing = [f"{k}={v}\n" for k, v in tester_updates.items() if k not in seen_keys]
-        if missing:
-            print("New attributes added to [Tester]:")
-            for m in missing:
-                print("  " + m.strip())
-        new_lines = new_lines[:tester_end_index] + missing + new_lines[tester_end_index:]
-
-    # with open(ini_path, "w") as f:
-    #     f.writelines(new_lines)
     with open(ini_path, "w", encoding="utf-16", newline="\r\n") as f:
         f.writelines(new_lines)
 
@@ -817,6 +1122,27 @@ def run_mt5_backtest(config_path, terminal_path, report_path, log_path, store_pa
             print(f"copied latest_log_file:{latest_log_file} to archieve_folder:{archieve_folder}")
     print(f"done backtesting with run_id:{run_id}, archieve_folder:{archieve_folder}, report_file:{report_file}, latest_log_file:{latest_log_file}")
     return run_id, archieve_folder, report_file, latest_log_file
+
+def mt5_html_to_xlsx(html_path: str):
+    # --- Build XLSX path from HTML path ---
+    base, _ = os.path.splitext(html_path)
+    xlsx_path = base + ".xlsx"
+
+    # --- Load HTML ---
+    with open(html_path, "r", encoding="utf-16") as f:  # MT5 often uses UTF-16
+        soup = BeautifulSoup(f, "html.parser")
+
+    # --- Extract tables ---
+    tables = pd.read_html(str(soup))
+
+    # --- Write to XLSX ---
+    with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
+        for idx, df in enumerate(tables):
+            sheet_name = f"Table_{idx}"
+            df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+    print(f"Saved XLSX: {xlsx_path}")
+    return xlsx_path
 
 def report_tables_to_json(report_file, archieve_folder, output_json="report_tables.json"):
     """
@@ -955,6 +1281,23 @@ def beautify_report(data):
 
     return data
 
+def compress_table(table):
+    compressed = {}
+    for item in table:
+        if "label" in item and "value" in item:
+            # label/value pair → key:value
+            key = item["label"].rstrip(":")
+            compressed[key] = item["value"]
+        elif "value" in item:
+            val = item["value"]
+            if "=" in val:
+                key, value = val.split("=", 1)
+                compressed[key] = value
+            else:
+                # fallback if no '=' and no label
+                compressed[val] = None
+    return compressed
+
 def extract_tester_report_summary(json_file):
     """
     Load a tester report JSON, clean it with beautify_report,
@@ -976,40 +1319,65 @@ def extract_tester_report_summary(json_file):
     # Apply cleaning
     cleaned_data = beautify_report(raw_data)
 
+    compressed_data = {}
+    for key, table in raw_data.items():
+        if key in ("table_0", "table_inputs", "table_results"):
+            compressed_data[key] = compress_table(table)
+        else:
+            compressed_data[key] = table
+
     # Save cleaned report
     report_tables_clean_file = json_file.parent / "report_tables_clean.json"
     with report_tables_clean_file.open("w", encoding="utf-8") as f:
-        json.dump(cleaned_data, f, indent=4, ensure_ascii=False)
+        json.dump(compressed_data, f, indent=4, ensure_ascii=False)
     print(f"Cleaned report saved to: {report_tables_clean_file}")
 
     # Remove unnecessary tables if present
     for key in ("table_0", "table_inputs"):
-        if key in cleaned_data:
-            del cleaned_data[key]
+        if key in compressed_data:
+            del compressed_data[key]
 
     # Delete original file safely
     if json_file.exists():
         json_file.unlink()
         print(f"Original file removed: {json_file}")
 
-    return cleaned_data, report_tables_clean_file
+    return compressed_data, report_tables_clean_file
 
 def load_params_from_ini(ini_file):
     """
     Load parameters from an INI file into a dict.
+    Optionally update ORDERS_COMMENT to a new value.
     """
     config = configparser.ConfigParser()
-    config.read(ini_file)
+    # config.read(ini_file)
+    with open(ini_file, "r", encoding="utf-16") as f:
+        config.read_file(f)
 
     # Assume parameters are under a section called [Parameters]
     params = dict(config["Tester"])
+    params["ORDERS_COMMENT"] = config["TesterInputs"].get("ORDERS_COMMENT")
     return params
 
 def save_run_and_update_memory(run_id, parameters, archieve_folder, report_files, log_file, vector_ids):
     
+    # extract ORDER_COMMENT from report_file
+    print("Type of report_files:", type(report_files))
+    # report_files_path = os.path.join(archieve_folder, report_files)
+    report_files_path = os.path.join(archieve_folder, report_files[0])
+    print("report_files_path:", report_files_path)
+    if not os.path.isfile(report_files_path):
+        print(f"❌ File not found: {report_files_path}")
+        return None
+    with open(report_files_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    ORDERS_COMMENT = data.get("table_inputs", {}).get("ORDERS_COMMENT")
+
     metadata = {
         "run_id": run_id,
         "run_id_num": 0,
+        "run_mq5_version": ORDERS_COMMENT,
         "timestamp": datetime.now().isoformat(),
         "parameters": parameters,
         "artifacts": {
@@ -1019,6 +1387,8 @@ def save_run_and_update_memory(run_id, parameters, archieve_folder, report_files
         },
         "vector_db": vector_ids,
     }
+    
+
     # --- Save metadata.json inside archive folder ---
     os.makedirs(archieve_folder, exist_ok=True)
     metadata_path = Path(archieve_folder) / "metadata.json"
@@ -1032,11 +1402,14 @@ def save_run_and_update_memory(run_id, parameters, archieve_folder, report_files
     ltm = JSONMemory(path="memory.json")
     prev_run_id = ltm.get("LAST_RUN_ID")
     prev_run_id_num = ltm.get("LAST_RUN_ID_NUM")
+    prev_run_mq5_version = ltm.get("LAST_RUN_MQ5_VERSION")
     prev_archieve = ltm.get("LAST_RUN_ARCHIEVE")
 
     ltm.store("LAST_RUN_ID", run_id)
     ltm.store("LAST_RUN_ID_NUM", 0)
+    ltm.store("LAST_RUN_MQ5_VERSION", ORDERS_COMMENT)
     ltm.store("LAST_RUN_ARCHIEVE", archieve_folder)
+
     ltm.store("LAST_RUN_CODE_EMBEDDING_ID", vector_ids.get("code_embedding_id"))
     ltm.store("LAST_RUN_HEADER_EMBEDDING_ID", vector_ids.get("header_embedding_id"))
     ltm.store("LAST_RUN_LOG_EMBEDDING_ID", vector_ids.get("log_embedding_id"))
@@ -1045,6 +1418,7 @@ def save_run_and_update_memory(run_id, parameters, archieve_folder, report_files
         if prev_run_id != run_id or prev_run_id_num != 0:
             ltm.store("PREV_LAST_RUN_ID", prev_run_id)
             ltm.store("PREV_LAST_RUN_ID_NUM", prev_run_id_num)
+            ltm.store("LAST_RUN_MQ5_VERSION", prev_run_mq5_version)
             ltm.store("PREV_LAST_RUN_ARCHIEVE", prev_archieve)
             print(f"updated PREV_LAST_RUN")
 
@@ -1054,24 +1428,6 @@ def save_run_and_update_memory(run_id, parameters, archieve_folder, report_files
     ltm.store("RUN_HISTORY", history)
 
     print(f"✅ Saved run {run_id} with num {metadata_num} and updated memory.json")
-
-def get_last_run_info():
-    """Retrieve last run metadata from JSON-based memory."""
-    ltm = JSONMemory(path="memory.json")
-    return {
-        "run_id": ltm.get("LAST_RUN_ID"),
-        'run_id_num': ltm.get("LAST_RUN_ID_NUM"),
-        "archieve": ltm.get("LAST_RUN_ARCHIEVE"),
-        "rprev_un_id": ltm.get("PREV_LAST_RUN_ID"),
-        'prev_run_id_num': ltm.get("PREV_LAST_RUN_ID_NUM"),
-        "prev_archieve": ltm.get("PREV_LAST_RUN_ARCHIEVE"),
-        "vector_db": {
-            "code_embedding_id": ltm.get("LAST_RUN_CODE_EMBEDDING_ID"),
-            "log_embedding_id": ltm.get("LAST_RUN_LOG_EMBEDDING_ID"),
-            "report_embedding_id": ltm.get("LAST_RUN_REPORT_EMBEDDING_ID"),
-            "header_embedding_id": ltm.get("LAST_RUN_HEADER_EMBEDDING_ID")  # singular for consistency
-        }
-    }
 
 def read_file_safely(file_path):
     ext = Path(file_path).suffix.lower()
@@ -2165,29 +2521,6 @@ def clean_log(input_file: str, archieve_folder: str = "archieve") -> str:
 
     raise ValueError("Failed to decode file with common encodings.")
 
-# def record_git_commit_to_metadata_and_memory(run_id, commit_hash, repo_dir, archieve_folder):
-#     """
-#     Record the latest Git commit hash into metadata.json and memory.json.
-#     """
-#     # Update metadata.json
-#     metadata_path = os.path.join(archieve_folder, "metadata.json")
-#     if os.path.exists(metadata_path):
-#         with open(metadata_path, "r", encoding="utf-8") as f:
-#             metadata = json.load(f)
-#     else:
-#         metadata = {}
-
-#     metadata["git_commit_hash"] = commit_hash
-#     with open(metadata_path, "w", encoding="utf-8") as f:
-#         json.dump(metadata, f, indent=4)
-
-#     # Update memory.json
-#     ltm = JSONMemory(path="memory.json")
-#     ltm.store("LAST_RUN_ID", run_id)
-#     ltm.store("LAST_RUN_GIT_COMMIT", commit_hash)
-
-#     print(f"Recorded commit {commit_hash} for run {run_id}")
-#     return commit_hash
 
 load_dotenv()
 OLLAMA_SERVER = os.getenv("OLLAMA_API_BASE")

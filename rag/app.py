@@ -4,16 +4,18 @@ import difflib
 import os
 import json
 import websocket
-from datetime import datetime
+# from datetime import datetime
+import datetime
+
 from dotenv import load_dotenv
 from langchain_ollama import OllamaLLM
 from langchain_community.chat_message_histories import StreamlitChatMessageHistory # stores message history
 from cleanstore import clean_store, clean_snippets_json
-from testMT5 import build_nested_structure, update_ini_file, run_mt5_backtest, copyfiles, compile_ea, extract_errors, count_tokens, load_all_skills_name, \
+from testMT5 import build_nested_structure, update_ini_file, run_mt5_backtest, copyfiles, compile_ea, extract_errors, count_tokens, \
 report_tables_to_json, load_params_from_ini, store_history_snippets_json, apply_patch_to_git, get_patch_content, process_run_for_embeddings, \
 save_run_and_update_memory, generate_patch_from_git, get_latest_snippet_json_data, beautify_text_area, find_patch_history, get_log_attributes, \
 extract_tester_report_summary, analyze_and_improve, clean_log, suggest_code_improvements, compile_fail_update_memory, orchestrate_with_safe_invoke, \
-build_dataframe_from_log
+build_dataframe_from_log, json_log_to_excel, mt5_html_to_xlsx
 
 load_dotenv()
 OLLAMA_SERVER = os.getenv("OLLAMA_API_BASE")
@@ -23,32 +25,72 @@ def preview_improvements():
 
     st.subheader("Copy source files to MT5")
     with st.form("copyfiles_form"):
+        col1, col2, col3, col4 = st.columns([2 ,2, 2, 5])  # adjust ratio for width
+        with col1:
+            ea_mq5_selected = st.checkbox("🔍EA_MQ5", value=False)
+        with col2:
+            ea_header_selected = st.checkbox("🔍EA_HEADER", value=False)
+        with col3:
+            trade_header_selected = st.checkbox("🔍TRADE_HEADER", value=True)
+        with col4:
+            backtested_data_selected = st.checkbox("🔍BACKTESTED_DATA", value=True)
+
         # You can add inputs here if needed, e.g. text boxes for paths
-        copyfiles_submitted = st.form_submit_button("Copy files")
-        if copyfiles_submitted:
+        copyfiles2MT5_submitted = st.form_submit_button("Copy to MT5/project")
+        copyfilesfromproject_submitted = st.form_submit_button("Copy from project")
+        if copyfiles2MT5_submitted:
             try:
-                commit_copyfiles = copyfiles(
+                commit_copyfiles2MT5 = copyfiles(
                     os.getenv("EA_CODE_GIT_REPO"), 
                     os.getenv("EA_MQ5_SUBPATH"), 
-                    os.getenv("EA_HEADER_SUBPATH"), 
-                    os.getenv("AGENT_PATH")
+                    os.getenv("EA_HEADER_SUBPATH"),
+                    os.getenv("AGENT_PATH"),
+                    ea_mq5_selected,
+                    ea_header_selected,
+                    trade_header_selected,
+                    backtested_data_selected,
+                    1
                 )
-                st.session_state["commit_copyfiles"] = commit_copyfiles
+                st.session_state["commit_copyfiles2MT5"] = commit_copyfiles2MT5
                 # Store history if commit info is available
                 store_history_snippets_json(
-                    "copyfiles",
+                    "copyfilesto",
                     f"Files copied from {os.getenv('EA_CODE_GIT_REPO')} "
                     f"to {os.getenv('AGENT_PATH')} successfully "
-                    f"with latest commit: {st.session_state["commit_copyfiles"]}"
+                    f"with latest commit: {st.session_state["commit_copyfiles2MT5"]}"
                 )
             except Exception as e:
                 st.error(f"❌ Copy operation failed: {e}")
 
-        if st.session_state.get("commit_copyfiles"):
+        if copyfilesfromproject_submitted:
+            try:
+                commit_copyfilesfromproject = copyfiles(
+                    os.getenv("EA_CODE_GIT_REPO"), 
+                    os.getenv("EA_MQ5_SUBPATH"), 
+                    os.getenv("EA_HEADER_SUBPATH"),
+                    os.getenv("AGENT_PATH"),
+                    ea_mq5_selected,
+                    ea_header_selected,
+                    trade_header_selected,
+                    backtested_data_selected,
+                    0
+                )
+                st.session_state["commit_copyfilesfromproject"] = commit_copyfilesfromproject
+                # Store history if commit info is available
+                store_history_snippets_json(
+                    "copyfilesfrom",
+                    f"Files copied from {os.getenv('EA_CODE_GIT_REPO')} "
+                    f"to {os.getenv('AGENT_PATH')} successfully "
+                    f"with latest commit: {st.session_state["commit_copyfilesfromproject"]}"
+                )
+            except Exception as e:
+                st.error(f"❌ Copy operation failed: {e}")
+
+        if st.session_state.get("commit_copyfiles2MT5"):
             st.success(
                 f"✅ Files copied from {os.getenv('EA_CODE_GIT_REPO')} "
                 f"to {os.getenv('AGENT_PATH')} successfully "
-                f"with latest commit: {st.session_state["commit_copyfiles"]}"
+                f"with latest commit: {st.session_state["commit_copyfiles2MT5"]}"
             )
         # else:
         #     st.warning("⚠️ Files copy failed or no commit info available.")
@@ -93,11 +135,16 @@ def preview_improvements():
     # --- Run MT5 Backtest button ---
     st.subheader("Run MT5 Backtest")
     with st.form("edit_backtest_form"):
-        col1, col2, _ = st.columns([1.5 ,1, 10])  # adjust ratio for width
+        col1, col2, col3, col4, _ = st.columns([2 ,2, 2, 2, 5])  # adjust ratio for width
         with col1:
             visual_enable = st.checkbox("🔍 Include Visual")
         with col2:
-            timeout_value = st.number_input("⏱ Timeout (s)", min_value=5, max_value=5000, value=60, step=10)
+            timeout_value = st.number_input("⏱ Timeout (s)", min_value=5, max_value=20000, value=250, step=10)
+        with col3:
+            from_date_input = st.date_input("From Date", value=datetime.date(2026, 1, 1))
+        with col4:
+            to_date_input = st.date_input("To Date", value=datetime.date(2026, 1, 30))
+    
         run_backtest = st.form_submit_button("💾 Run Backtest")
         if run_backtest:
             try:
@@ -116,13 +163,15 @@ def preview_improvements():
                     expert=os.getenv("EA_EX_NAME"),
                     symbol="XAUUSD",
                     period="M5",
-                    from_date="2025.03.01",
-                    to_date="2025.03.20",
+                    from_date=from_date_input.strftime("%Y.%m.%d"),
+                    to_date=to_date_input.strftime("%Y.%m.%d"),
                     deposit=10000,
                     currency="USD",
                     leverage="1:100",
                     visual=visual_enable,
                     report_path="Tester_report.html",
+                    # version_file=os.path.normpath(os.path.join(os.getenv("PROJECT_PATH", r"C:\Users\Tofy3\Project\bb_mtf_strategy"),os.getenv("HEADER_SCRIPT_SUBPATH")))
+                    version_file=r"C:\Users\Tofy3\Project\bb_mtf_strategy\scripts\TofyTrade3.mqh"
                 )
 
                 # add column to insert portable, timeout and visual
@@ -136,6 +185,8 @@ def preview_improvements():
                     timeout=timeout_value,
                 )
 
+                # report_excel_path = mt5_html_to_xlsx(report_file)
+
                 # Convert report tables to JSON
                 json_report_file = report_tables_to_json(
                     report_file,
@@ -143,11 +194,11 @@ def preview_improvements():
                     output_json="report_tables.json",
                 )
 
-                # clean log file
-                clean_log_file = clean_log(log_file, archieve_folder=archieve_folder)
-
                 # Parse summary from JSON
                 summary, json_report_file = extract_tester_report_summary(json_report_file)
+
+                # clean log file
+                clean_log_file = clean_log(log_file, archieve_folder=archieve_folder)
 
                 # Store results in session state for later use
                 st.session_state["run_id"] = run_id
@@ -177,29 +228,15 @@ def preview_improvements():
     with st.form("vector_store_form"):
         faiss_embedded_enable = st.checkbox("🔍 FAISS mebedded", value=True)
         
-        col1, col2, _ = st.columns([3 ,2, 6])  # adjust ratio for width
+        col1, col2, col3 = st.columns([3 ,2, 6])  # adjust ratio for width
         with col1:
             # visual_enable = st.checkbox("🔍 Include Visual")
             Store_submitted = st.form_submit_button("Store to Vector Store")
         with col2:
             # timeout_value = st.number_input("⏱ Timeout (s)", min_value=5, max_value=5000, value=60, step=10)
-            log_convert_submitted = st.form_submit_button("JSON LOG")
-
-
-        # Step 1: Get attributes
-        # st.subheader("Select Attributes from Log")
-        # if st.session_state.get("log_attributes"):
-        #     # Step 2: Show checkboxes
-        #     selected_attributes = []
-        #     for attr in st.session_state["log_attributes"]:
-        #         if st.checkbox(f" {attr}", value=True):
-        #             selected_attributes.append(attr)
-
-        if log_convert_submitted:
-            # Step 3: Build DataFrame with selected attributes
-            # df_filtered = build_dataframe_from_log(st.session_state["clean_log_file"], selected_attributes, st.session_state["archieve_folder"])
-            # st.dataframe(df_filtered)
-            df_filtered = build_nested_structure(st.session_state["clean_log_file"], st.session_state["archieve_folder"])
+            log2json_submitted = st.form_submit_button("JSON LOG")
+        with col3:
+            json2excel_summitted = st.form_submit_button("EXCEL LOG") 
 
         if Store_submitted:
             try:
@@ -242,19 +279,44 @@ def preview_improvements():
                     if st.session_state.get("previous_patch_json"):
                         store_history_snippets_json("previous_patch",st.session_state["previous_patch_json"], False)
 
-                    # start new session
-                    st.session_state.clear()
-                    st.success("All session_state cleared!")
-                    print("All session_state cleared!")
-
                     st.success(f"✅ Metadata saved at: {metadata_path}")
                     st.session_state["Metadata"] = metadata_path
                     st.write(f"Vector IDs: {vector_ids}")
+                
+                if st.session_state.get("vector_store") and st.session_state.get("Metadata"):
+                    st.info(f" stored to vector store! Vector IDs: {st.session_state["vector_store"]}, Metadata saved at: {st.session_state["Metadata"]}")
+
             except Exception as e:
                 st.error(f"❌ Failed to store run to vector store: {e}")
+        
+        if log2json_submitted:
+            archieve_folder = st.session_state.get("archieve_folder")
+            clean_log_file = st.session_state.get("clean_log_file")
+            if not archieve_folder or not clean_log_file:
+                st.error("❌ Missing archive folder or log file. Please run a backtest first.")
+            else:
+                try:
+                    log_json_path = build_nested_structure(clean_log_file, archieve_folder)
+                    if log_json_path:
+                        st.success(f"✅ log to json at: {log_json_path}")
+                        st.session_state["log_json"] = log_json_path
+                except Exception as e:
+                    st.error(f"❌ Failed to convert log to json: {e}")
 
-        if st.session_state.get("vector_store") and st.session_state.get("Metadata"):
-            st.info(f" stored to vector store! Vector IDs: {st.session_state["vector_store"]}, Metadata saved at: {st.session_state["Metadata"]}")
+        if json2excel_summitted:
+            archieve_folder = st.session_state.get("archieve_folder")
+            log_json_path = st.session_state.get("log_json")
+            if not archieve_folder or not log_json_path:
+                st.error("❌ Missing archive folder or log json file. Please run a backtest first.")
+            else:
+                try:
+                    df, log_csv_path , log_excel_path = json_log_to_excel(log_json_path, archieve_folder)
+                    if log_csv_path and log_excel_path:
+                        st.success(f"✅ log to csv at:{log_csv_path}, excel at: {log_excel_path}")
+                        st.session_state["log_csv"] = log_excel_path
+                        st.session_state["log_excel"] = log_excel_path
+                except Exception as e:
+                    st.error(f"❌ Failed to convert log json to excel: {e}")
 
     # --- Improvements summary ---
     st.subheader("Analyze Improve Summary")
@@ -272,19 +334,12 @@ def preview_improvements():
         prompt_suggestions = st.text_area("Prompt", prompt_text, height=300)
     
         # Checkbox to decide whether to fetch snippets
-        col1, col2, col3, _ = st.columns([2, 2, 2, 4], gap="xxsmall")
+        col1, col2, _, _ = st.columns([2, 2, 2, 4], gap="xxsmall")
         with col1:
             snippets_enable = st.checkbox("🔍 Include FAISS snippets", value=False)
 
         with col2:
             json_chunk_enable = st.checkbox("🔍 Include JSON chunks", value=True)
-
-        with col3:
-            # load_all_skills()
-            skill_choice = st.selectbox(
-                "Choose Superpower skill",
-                load_all_skills_name(os.path.join(os.getenv("SUPERPOWER_DIR"), os.getenv("SUPERPOWER_SKILL_SUBPATH")))
-            )
         
         analyze_submitted = st.form_submit_button("Analyze && Improve")
 
@@ -552,73 +607,73 @@ explanation_code show the explanation of fix_code.
                         store_history_snippets_json("patch_to_git", f"{full_commit_message} push={github_push_enable}")
                     st.success(f"Applied patch file {st.session_state["latest_patch_path"]} to git repo {os.getenv("EA_CODE_GIT_REPO")} with commit {full_commit_message}")
 
-    st.subheader("Superpowers Skill Runner")
-    history = StreamlitChatMessageHistory()
+    # st.subheader("Superpowers Skill Runner")
+    # history = StreamlitChatMessageHistory()
 
-    skills_dir = os.path.join(
-        os.getenv("SUPERPOWER_DIR"),
-        os.getenv("SUPERPOWER_SKILL_SUBPATH")
-    )
+    # skills_dir = os.path.join(
+    #     os.getenv("SUPERPOWER_DIR"),
+    #     os.getenv("SUPERPOWER_SKILL_SUBPATH")
+    # )
 
-    skill_choice = st.selectbox(
-        "Choose Superpower skill",
-        load_all_skills_name(skills_dir)
-    )
+    # skill_choice = st.selectbox(
+    #     "Choose Superpower skill",
+    #     load_all_skills_name(skills_dir)
+    # )
 
-    reasoning_data = st.checkbox("include reasoning data")
+    # reasoning_data = st.checkbox("include reasoning data")
 
-    # Initialize flags
-    if "waiting_reply" not in st.session_state:
-        st.session_state.waiting_reply = False
-    if "reply_done" not in st.session_state:
-        st.session_state.reply_done = False
+    # # Initialize flags
+    # if "waiting_reply" not in st.session_state:
+    #     st.session_state.waiting_reply = False
+    # if "reply_done" not in st.session_state:
+    #     st.session_state.reply_done = False
 
-    # Show full history
-    for msg in history.messages:
-        if msg.type == "human":
-            st.chat_message("user").markdown(msg.content)
-        elif msg.type == "ai":
-            st.chat_message("assistant").markdown(msg.content)
+    # # Show full history
+    # for msg in history.messages:
+    #     if msg.type == "human":
+    #         st.chat_message("user").markdown(msg.content)
+    #     elif msg.type == "ai":
+    #         st.chat_message("assistant").markdown(msg.content)
 
-    # Handle new input
-    if user_prompt := st.chat_input("Enter your request..."):
-        history.add_user_message(user_prompt)
+    # # Handle new input
+    # if user_prompt := st.chat_input("Enter your request..."):
+    #     history.add_user_message(user_prompt)
         
-        st.session_state.waiting_reply = True
-        st.session_state.reply_done = False
-        st.chat_message("user").markdown(user_prompt)
-        reasoning_prompt = user_prompt
-        if reasoning_data:
-            fixes_data = analyze_and_improve(
-                ollama_server=OLLAMA_SERVER, 
-                user_prompt="", 
-                snippets_enable=False, 
-                json_chunks_enable=True, 
-                query_text=None, 
-                enable_llminvoke=False
-            )
-            reasoning_prompt += fixes_data["reasoning_prompt"]
+    #     st.session_state.waiting_reply = True
+    #     st.session_state.reply_done = False
+    #     st.chat_message("user").markdown(user_prompt)
+    #     reasoning_prompt = user_prompt
+    #     if reasoning_data:
+    #         fixes_data = analyze_and_improve(
+    #             ollama_server=OLLAMA_SERVER, 
+    #             user_prompt="", 
+    #             snippets_enable=False, 
+    #             json_chunks_enable=True, 
+    #             query_text=None, 
+    #             enable_llminvoke=False
+    #         )
+    #         reasoning_prompt += fixes_data["reasoning_prompt"]
         
-        with st.spinner("Waiting for LLM reply..."):
-            reply = orchestrate_with_safe_invoke(
-                reasoning_prompt,
-                os.path.join(skills_dir, skill_choice, "SKILL.md"),
-                os.getenv("REASONING_AGENT"),
-                OLLAMA_SERVER
-            )
+    #     with st.spinner("Waiting for LLM reply..."):
+    #         reply = orchestrate_with_safe_invoke(
+    #             reasoning_prompt,
+    #             os.path.join(skills_dir, skill_choice, "SKILL.md"),
+    #             os.getenv("REASONING_AGENT"),
+    #             OLLAMA_SERVER
+    #         )
 
-        history.add_ai_message(reply)
-        st.chat_message("assistant").markdown(reply)
+    #     history.add_ai_message(reply)
+    #     st.chat_message("assistant").markdown(reply)
 
-        # Update flags
-        st.session_state.waiting_reply = False
-        st.session_state.reply_done = True
+    #     # Update flags
+    #     st.session_state.waiting_reply = False
+    #     st.session_state.reply_done = True
 
-    # Show status
-    if st.session_state.waiting_reply:
-        st.info("⏳ Waiting for reply...")
-    elif st.session_state.reply_done:
-        st.success("✅ Reply received and displayed.")
+    # # Show status
+    # if st.session_state.waiting_reply:
+    #     st.info("⏳ Waiting for reply...")
+    # elif st.session_state.reply_done:
+    #     st.success("✅ Reply received and displayed.")
 
 
 if __name__ == "__main__":
