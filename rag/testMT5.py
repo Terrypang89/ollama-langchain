@@ -11,6 +11,7 @@ import shutil
 import glob
 import json
 import re
+import csv
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_ollama import OllamaEmbeddings, OllamaLLM
@@ -551,6 +552,7 @@ def json_log_to_excel(json_file: str, archive_folder: str, base_name: str = "log
 
     # --- Pass 2: Collect values aligned to headers ---
     rows = []
+    last_dt = None   # track last datetime
     for ts, categories in data.items():
         for cat, content in categories.items():
             if isinstance(content, dict):
@@ -563,7 +565,11 @@ def json_log_to_excel(json_file: str, archive_folder: str, base_name: str = "log
                     else:
                         attr_dict[k] = v   # don’t wrap in str()
 
-                row = {"datetime": ts, "category": cat}
+                # replace repeated datetime with quote
+                dt_val = ts if ts != last_dt else '~'
+                last_dt = ts
+
+                row = {"datetime": dt_val, "category": cat}
                 for i,h in enumerate(headers, start=1):
                     attr_names = h.split("/")
                     val = ""
@@ -583,7 +589,11 @@ def json_log_to_excel(json_file: str, archive_folder: str, base_name: str = "log
                         else:
                             attr_dict[k] = str(v)
 
-                    row = {"datetime": ts, "category": f"TRADEINFO{idx}"}
+                    # replace repeated datetime with quote
+                    dt_val = ts if ts != last_dt else '~'
+                    last_dt = ts
+
+                    row = {"datetime": dt_val, "category": f"TRADEINFO{idx}"}
                     for i,h in enumerate(headers, start=1):
                         attr_names = h.split("/")
                         val = ""
@@ -641,6 +651,7 @@ def json_log_to_excel(json_file: str, archive_folder: str, base_name: str = "log
     xlsx_path = archive_path / f"{base_name}.xlsx"
 
     df.to_csv(csv_path, index=False, encoding="utf-8")
+    # df.to_csv(csv_path, index=False, encoding="utf-8", quoting=csv.QUOTE_NONE, escapechar='\\')
     df.to_excel(xlsx_path, index=False, engine="openpyxl")
 
     return df, csv_path, xlsx_path
@@ -856,93 +867,6 @@ def compile_fail_update_memory(base_path=""):
     except Exception as e:
         print(f"❌ Failed to update memory.json: {e}")
         return None
-
-# def update_ini_file(
-#     ini_path,
-#     login,
-#     password,
-#     server,
-#     expert,
-#     symbol="XAUUSD",
-#     period="M5",
-#     from_date="2025.03.01",
-#     to_date="2025.04.01",
-#     deposit=10000,
-#     currency="USD",
-#     leverage="1:100",
-#     visual=False,
-#     report_path=r"C:\Users\Tofy3\Downloads\Tester_report.html",
-# ):
-#     tester_updates = {
-#         "Expert": expert,
-#         "Symbol": symbol,
-#         "Period": period,
-#         "Optimization": "0",
-#         "Model": "0",
-#         "FromDate": from_date,
-#         "ToDate": to_date,
-#         "ForwardMode": "0",
-#         "Deposit": str(deposit),
-#         "Currency": currency,
-#         "ProfitInPips": "0",
-#         "Leverage": leverage,
-#         "ExecutionMode": "0",
-#         "OptimizationCriterion": "0",
-#         "Visual": int(visual),
-#         "ShutdownTerminal": "1",
-#         "ReplaceReport": "1",
-#         "Report": report_path,   # ✅ ensure Report is always present
-#     }
-
-#     with open(ini_path, "r", encoding="utf-16") as f:
-#         lines = f.readlines()
-
-#     new_lines = []
-#     in_tester = False
-#     seen_keys = set()
-#     tester_end_index = None
-
-#     for line in lines:
-#         stripped = line.strip()
-
-#         # Detect section headers
-#         if stripped.startswith("[") and stripped.endswith("]"):
-#             if stripped.lower() == "[tester]":
-#                 in_tester = True
-#             else:
-#                 if in_tester and tester_end_index is None:
-#                     tester_end_index = len(new_lines)  # mark end of Tester section
-#                 in_tester = False
-#             new_lines.append(line)
-#             continue
-
-#         if in_tester and "=" in stripped:
-#             key = stripped.split("=", 1)[0]
-#             if key in tester_updates:
-#                 new_lines.append(f"{key}={tester_updates[key]}\n")
-#                 seen_keys.add(key)
-#                 print(f"Updated attribute: {key}={tester_updates[key]}")
-#             else:
-#                 new_lines.append(line)
-#         else:
-#             new_lines.append(line)
-
-#     # If Tester section ended before TesterInputs, insert missing keys there
-#     if tester_end_index is not None:
-#         missing = [f"{k}={v}\n" for k, v in tester_updates.items() if k not in seen_keys]
-#         if missing:
-#             print("New attributes added to [Tester]:")
-#             for m in missing:
-#                 print("  " + m.strip())
-#         new_lines = new_lines[:tester_end_index] + missing + new_lines[tester_end_index:]
-
-#     # with open(ini_path, "w") as f:
-#     #     f.writelines(new_lines)
-#     with open(ini_path, "w", encoding="utf-16", newline="\r\n") as f:
-#         f.writelines(new_lines)
-
-#     print("Updated ini file:", ini_path)
-#     return str(ini_path)
 
 def update_ini_file(
     ini_path,
